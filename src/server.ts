@@ -162,16 +162,72 @@ app.get(['/iclock/cdata', '/cdata'], (req, res) => {
   res.status(200).send(responseText);
 });
 
+// ── HELPER: DEBUG DE CDATA DESCONOCIDA (FASE 2.1) ───────────────────────
+function handleUnknownCdataDebug(req: any, res: any) {
+  const device = res.locals.device;
+  const table = req.query.table as string;
+  const rawBody = req.body || '';
+
+  if (process.env.BIOMETRIC_DEBUG === 'true') {
+    // Extraer metadata del request
+    const method = req.method;
+    const pathname = req.path;
+    const queryKeys = Object.keys(req.query).join(',');
+    const contentType = req.headers['content-type'] || 'none';
+    const contentLength = req.headers['content-length'] || rawBody.length;
+    
+    // El payload de ZKTeco suele ser texto plano separado por saltos de línea (\r\n o \n)
+    const lines = rawBody.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
+    
+    // Analizar la primera línea para inferir campos
+    let detectedFields = '';
+    let pinStr = 'none';
+    let fidStr = 'none';
+    let sizeStr = 'none';
+    let templateLength = 0;
+
+    if (lines.length > 0) {
+      const firstLine = lines[0];
+      // Normalmente el ADMS envía pares Key=Value separados por tabuladores
+      const pairs = firstLine.split('\t');
+      const keys = [];
+      for (const pair of pairs) {
+        const eqIdx = pair.indexOf('=');
+        if (eqIdx > 0) {
+          const key = pair.substring(0, eqIdx);
+          const val = pair.substring(eqIdx + 1);
+          keys.push(key);
+          
+          const keyUpper = key.toUpperCase();
+          if (keyUpper === 'PIN' || keyUpper === 'USERID') pinStr = val;
+          if (keyUpper === 'FID') fidStr = val;
+          if (keyUpper === 'SIZE') sizeStr = val;
+          if (keyUpper === 'TMP' || keyUpper === 'TEMPLATE' || keyUpper === 'BIODATA') templateLength = val.length;
+        } else {
+          // Si no tiene '=', registramos que hay un token anónimo
+          keys.push('RAW_TOKEN');
+        }
+      }
+      detectedFields = keys.join(',');
+    }
+
+    logger.info('DEVICE CONNECT', `SN=${device.serial_number} method=${method} path=${pathname} queryKeys=[${queryKeys}] table=${table} contentType=${contentType} bodyLength=${contentLength} lines=${lines.length} fields=[${detectedFields}] PIN=${pinStr} FID=${fidStr} Size=${sizeStr} templateLength=${templateLength}`);
+  } else {
+    logger.info('DEVICE CONNECT', `Device SN: ${device.serial_number} uploaded table: ${table} (ignoring contents)`);
+  }
+
+  return res.status(200).send('OK');
+}
+
 // 2. Data Upload - Logs & Templates (POST /iclock/cdata or POST /cdata)
 app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
   const device = res.locals.device as Device;
   const table = req.query.table as string;
   const rawBody = req.body || '';
 
+  // ── DISPATCHER DE TABLAS ADMS ──
   if (table !== 'ATTLOG') {
-    // We only process attendance logs (ATTLOG). Other operations are acknowledged as OK.
-    logger.info('DEVICE CONNECT', `Device SN: ${device.serial_number} uploaded table: ${table} (ignoring contents)`, { bytes: rawBody.length });
-    return res.status(200).send('OK');
+    return handleUnknownCdataDebug(req, res);
   }
 
   logger.info('ATTENDANCE RECEIVED', `Device SN: ${device.serial_number} sent raw attendance logs`, { bytes: rawBody.length });
