@@ -1,4 +1,5 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { supabase } from './supabase.js';
 import { logger } from './logger.js';
 import { parseAttendanceLogs } from './parser.js';
@@ -11,6 +12,27 @@ const ZK_PUSH_SECRET = process.env.ZK_PUSH_SECRET || '';
 
 // Middleware to parse raw text bodies (since ZK devices upload plain text payloads)
 app.use(express.text({ type: '*/*', limit: '10mb' }));
+
+// ── RATE LIMITING ────────────────────────────────────────────────────────────
+// Flexible limits for ADMS devices to prevent abuse without breaking polling
+const admsRateLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 120, // 120 requests per minute per device
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const rawSn = (req.query.SN || req.query.sn) as string;
+    const sn = rawSn ? String(rawSn).trim().toUpperCase() : '';
+    if (sn) {
+      return `${sn}_${req.path}`;
+    }
+    return req.ip || 'unknown';
+  },
+  handler: (req, res) => {
+    logger.warn('RATE LIMIT', 'ADMS Rate limit exceeded', { ip: req.ip, sn: req.query.SN || req.query.sn });
+    res.status(429).send('TOO MANY REQUESTS');
+  }
+});
 
 // ── HEALTH CHECK ENDPOINTS ───────────────────────────────────────────────────
 
@@ -46,37 +68,48 @@ app.get('/health/supabase', async (req, res) => {
 
 const authorizeDevice = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   // ADMS protocol passes SN in query parameter (case insensitive check)
-  const sn = (req.query.SN || req.query.sn) as string;
+  const rawSn = String((req.query.SN || req.query.sn) ?? '').trim().toUpperCase();
 
-  if (!sn) {
+  if (!rawSn || rawSn.length > 50) {
     // Health checks or endpoints without SN are allowed to pass through if they don't require auth
     if (req.path === '/health' || req.path === '/health/supabase') {
       return next();
     }
-    logger.warn('DEVICE ERROR', 'Request missing device Serial Number (SN)', { path: req.path });
-    return res.status(400).send('BAD REQUEST: Missing SN');
+    logger.warn('DEVICE ERROR', 'Request missing or invalid device Serial Number (SN)', { path: req.path, rawSn });
+    return res.status(400).send('INVALID SERIAL');
   }
+
+  const sn = rawSn;
+
+  logger.info('DIAGNOSTICS', `ADMS SN raw: "${rawSn}"`);
+  logger.info('DIAGNOSTICS', `ADMS SN normalized: "${sn}"`);
 
   try {
     // 1. Fetch physical device registry in devices table
     const { data: device, error: devErr } = await supabase
       .from('devices')
       .select('*')
-      .eq('serial_number', sn.trim())
+      .eq('serial_number', sn)
       .maybeSingle();
+
+    logger.info('DIAGNOSTICS', `Device lookup: ${device ? 'FOUND' : 'NOT_FOUND'}`);
 
     if (devErr || !device) {
       logger.warn('DEVICE UNKNOWN', `Unauthorized or unregistered ZKTeco device SN: ${sn}`);
       return res.status(401).send('UNAUTHORIZED: Device not registered');
     }
 
+    logger.info('DIAGNOSTICS', `Device active: ${device.is_active ? 'TRUE' : 'FALSE'}`);
+
     // 2. Fetch tenant registration to find which client/tenant the device belongs to
     // and check if the tenant registration is active.
     const { data: dispositivo, error: dispErr } = await supabase
       .from('dispositivos')
       .select('*')
-      .eq('device_id_hikvision', sn.trim())
+      .eq('device_id_hikvision', sn)
       .maybeSingle();
+
+    logger.info('DIAGNOSTICS', `Tenant binding: ${dispositivo ? 'FOUND' : 'NOT_FOUND'}`);
 
     if (dispErr || !dispositivo) {
       logger.warn('DEVICE UNKNOWN', `Device SN: ${sn} has no tenant mapping in 'dispositivos'`);
@@ -129,7 +162,7 @@ const authorizeDevice = async (req: express.Request, res: express.Response, next
 };
 
 // Apply auth middleware to all /iclock or base endpoints
-app.use(['/iclock*', '/cdata*', '/getrequest*', '/devicecmd*'], authorizeDevice);
+app.use(['/iclock*', '/cdata*', '/getrequest*', '/devicecmd*'], admsRateLimiter, authorizeDevice);
 
 // ── ZK ADMS PROTOCOL ENDPOINTS ───────────────────────────────────────────────
 
@@ -346,7 +379,10 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
     if (logsToInsert.length > 0) {
       const { error: insertErr } = await supabase
         .from('attendance_logs')
-        .insert(logsToInsert);
+        .upsert(logsToInsert, {
+          onConflict: 'device_serial, user_id, timestamp',
+          ignoreDuplicates: true
+        });
 
       if (insertErr) {
         throw insertErr;
@@ -447,11 +483,19 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
     const returnCode = returnVal ? parseInt(returnVal, 10) : -1;
 
     // 1. Fetch the command to inspect command_string (which contains biometric_user_id)
+    // AND filter by device_serial to prevent a malicious device from ACK-ing other devices' commands
     const { data: command } = await supabase
       .from('device_commands')
       .select('*')
       .eq('id', commandId)
+      .eq('device_serial', device.serial_number)
       .maybeSingle();
+
+    if (!command) {
+      logger.warn('DEVICE WARNING', `Device SN: ${device.serial_number} reported ACK for unknown or unauthorized command ID: ${commandId}`);
+      // Still return OK so the device stops retrying an invalid command
+      return res.status(200).send('OK');
+    }
 
     // 2. Mark command as executed (success or fail) to clear it from the queue
     const { error: cmdUpdateErr } = await supabase

@@ -13,7 +13,10 @@ export type LogCategory =
   | 'COMMAND ERROR'
   | 'DEVICE ERROR'
   | 'SERVER ERROR'
-  | 'SERVER INIT';
+  | 'SERVER INIT'
+  | 'RATE LIMIT'
+  | 'DIAGNOSTICS'
+  | 'DEVICE WARNING';
 
 class Logger {
   private formatMessage(category: LogCategory, message: string, meta?: any): string {
