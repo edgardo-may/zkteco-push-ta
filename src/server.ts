@@ -1,5 +1,5 @@
 import express from 'express';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { supabase } from './supabase.js';
 import { logger } from './logger.js';
 import { parseAttendanceLogs } from './parser.js';
@@ -7,6 +7,7 @@ import { Device, Dispositivo } from './types.js';
 import 'dotenv/config';
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const ZK_PUSH_SECRET = process.env.ZK_PUSH_SECRET || '';
 
@@ -20,13 +21,13 @@ const admsRateLimiter = rateLimit({
   max: 120, // 120 requests per minute per device
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => {
+  keyGenerator: (req, res) => {
     const rawSn = (req.query.SN || req.query.sn) as string;
     const sn = rawSn ? String(rawSn).trim().toUpperCase() : '';
     if (sn) {
       return `${sn}_${req.path}`;
     }
-    return req.ip || 'unknown';
+    return ipKeyGenerator(req.ip || 'unknown');
   },
   handler: (req, res) => {
     logger.warn('RATE LIMIT', 'ADMS Rate limit exceeded', { ip: req.ip, sn: req.query.SN || req.query.sn });
@@ -47,12 +48,12 @@ app.get('/health', (req, res) => {
 
 app.get('/health/supabase', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('devices').select('count', { count: 'exact', head: true });
+    const { count, error } = await supabase.from('devices').select('*', { count: 'exact', head: true });
     if (error) throw error;
     res.status(200).json({
       status: 'OK',
       database: 'connected',
-      device_count: data || 0
+      device_count: count ?? 0
     });
   } catch (err: any) {
     logger.error('SERVER ERROR', 'Supabase health check failed', err);
