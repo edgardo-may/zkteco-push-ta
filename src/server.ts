@@ -564,37 +564,47 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
 
     const returnCode = returnVal ? parseInt(returnVal, 10) : -1;
 
-    // 1. Resolver el comando considerando el truncamiento de 35 caracteres del firmware ZK
-    let { data: command } = await supabase
-      .from('device_commands')
-      .select('*')
-      .eq('id', commandId)
-      .eq('device_serial', device.serial_number)
-      .maybeSingle();
+// 1. Resolver el comando (compatible con ID corto o ID truncado)
+    let command = null;
 
-    // Si no coincide exactamente (por truncamiento del último caracter), buscar por prefijo
-    if (!command) {
-      const { data: prefixMatch } = await supabase
+    // A. Intento de coincidencia exacta si es un UUID válido
+    if (commandId.length === 36) {
+      const { data } = await supabase
         .from('device_commands')
         .select('*')
-        .ilike('id', `${commandId}%`)
+        .eq('id', commandId)
         .eq('device_serial', device.serial_number)
-        .order('created_at', { ascending: false })
-        .limit(1)
         .maybeSingle();
+      command = data;
+    }
 
-      command = prefixMatch;
+    // B. Si es corto o truncado, buscar el comando pendiente más reciente de este equipo
+    if (!command) {
+      const { data: pendingCommands } = await supabase
+        .from('device_commands')
+        .select('*')
+        .eq('device_serial', device.serial_number)
+        .eq('is_executed', false)
+        .order('created_at', { ascending: false })
+        .limit(10);
+
+      if (pendingCommands && pendingCommands.length > 0) {
+        // Encontrar el comando cuyo ID empiece con el ID recibido o que coincida con el shortId
+        command = pendingCommands.find(c => {
+          const cleanId = c.id.replace(/-/g, '');
+          return c.id.startsWith(commandId) || cleanId.startsWith(commandId);
+        });
+      }
     }
 
     if (!command) {
       logger.warn('DEVICE WARNING', `Device SN: ${device.serial_number} reported ACK for unknown or unauthorized command ID: ${commandId}`);
-      // Return OK so the device stops retrying an invalid command
       return res.status(200).send('OK');
     }
 
     const resolvedId = command.id;
 
-    // 2. Mark command as executed (success or fail) to clear it from the queue
+    // 2. Marcar como ejecutado usando el UUID original resuelto
     const { error: cmdUpdateErr } = await supabase
       .from('device_commands')
       .update({
