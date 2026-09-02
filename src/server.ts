@@ -3,7 +3,7 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { supabase } from './supabase.js';
 import { logger } from './logger.js';
 import { parseAttendanceLogs } from './parser.js';
-import { Device, Dispositivo } from './types.js';
+import { Device } from './types.js';
 import 'dotenv/config';
 
 const app = express();
