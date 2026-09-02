@@ -563,20 +563,35 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
 
     const returnCode = returnVal ? parseInt(returnVal, 10) : -1;
 
-    // 1. Fetch the command to inspect command_string (which contains biometric_user_id)
-    // AND filter by device_serial to prevent a malicious device from ACK-ing other devices' commands
-    const { data: command } = await supabase
+    // 1. Resolver el comando considerando el truncamiento de 35 caracteres del firmware ZK
+    let { data: command } = await supabase
       .from('device_commands')
       .select('*')
       .eq('id', commandId)
       .eq('device_serial', device.serial_number)
       .maybeSingle();
 
+    // Si no coincide exactamente (por truncamiento del último caracter), buscar por prefijo
+    if (!command) {
+      const { data: prefixMatch } = await supabase
+        .from('device_commands')
+        .select('*')
+        .ilike('id', `${commandId}%`)
+        .eq('device_serial', device.serial_number)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      command = prefixMatch;
+    }
+
     if (!command) {
       logger.warn('DEVICE WARNING', `Device SN: ${device.serial_number} reported ACK for unknown or unauthorized command ID: ${commandId}`);
-      // Still return OK so the device stops retrying an invalid command
+      // Return OK so the device stops retrying an invalid command
       return res.status(200).send('OK');
     }
+
+    const resolvedId = command.id;
 
     // 2. Mark command as executed (success or fail) to clear it from the queue
     const { error: cmdUpdateErr } = await supabase
@@ -585,7 +600,7 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
         is_executed: true,
         updated_at: new Date().toISOString()
       })
-      .eq('id', commandId);
+      .eq('id', resolvedId);
 
     if (cmdUpdateErr) throw cmdUpdateErr;
 
@@ -608,10 +623,9 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
             .eq('device_id', device.id)
             .eq('biometric_user_id', biometricUserId);
 
-          logger.info('COMMAND SUCCESS', `Command ${commandId} successfully executed by device SN: ${device.serial_number} (Return: ${returnCode}). Assignment for user ${biometricUserId} marked as SYNCED.`);
+          logger.info('COMMAND SUCCESS', `Command ${resolvedId} successfully executed by device SN: ${device.serial_number} (Return: ${returnCode}). Assignment for user ${biometricUserId} marked as SYNCED.`);
         } else {
           // Failure
-          // First query current retry count to increment it
           const { data: currentAssignment } = await supabase
             .from('device_employee_assignments')
             .select('retry_count')
@@ -631,14 +645,14 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
             .eq('device_id', device.id)
             .eq('biometric_user_id', biometricUserId);
 
-          logger.warn('COMMAND ERROR', `Command ${commandId} failed execution on device SN: ${device.serial_number} (Return: ${returnCode}). Assignment for user ${biometricUserId} marked as ERROR.`);
+          logger.warn('COMMAND ERROR', `Command ${resolvedId} failed execution on device SN: ${device.serial_number} (Return: ${returnCode}). Assignment for user ${biometricUserId} marked as ERROR.`);
         }
       }
     } else {
       if (returnCode === 0) {
-        logger.info('COMMAND SUCCESS', `Command ${commandId} successfully executed by device SN: ${device.serial_number} (Return: ${returnCode})`);
+        logger.info('COMMAND SUCCESS', `Command ${resolvedId} successfully executed by device SN: ${device.serial_number} (Return: ${returnCode})`);
       } else {
-        logger.warn('COMMAND ERROR', `Command ${commandId} failed execution on device SN: ${device.serial_number} (Return: ${returnCode})`);
+        logger.warn('COMMAND ERROR', `Command ${resolvedId} failed execution on device SN: ${device.serial_number} (Return: ${returnCode})`);
       }
     }
 
