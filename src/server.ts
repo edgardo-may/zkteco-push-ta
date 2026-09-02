@@ -529,7 +529,8 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
     }
 
     // Format the command string in ZKTeco ADMS syntax: C:<command_id>:<command_string>
-    const responseText = `C:${nextCommand.id}:${nextCommand.command_string}\n`;
+    const shortCmdId = nextCommand.id.replace(/-/g, '').substring(0, 8);
+    const responseText = `C:${shortCmdId}:${nextCommand.command_string}\n`;
 
     logger.info('COMMAND SENT', `Sent command ${nextCommand.id} to device SN: ${device.serial_number}: ${nextCommand.command_string}`);
 
