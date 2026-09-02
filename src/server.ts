@@ -352,7 +352,7 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    const dispositivo = res.locals.dispositivo as Dispositivo;
+    const clienteId = res.locals.clienteId as string;
 
     // ── EMPLOYEE IDENTIFICATION ──────────────────────────────────────────────
     // Query active assignments for this device, linking only active employees
@@ -426,7 +426,7 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
       const empInfo = validEmployeeMap.get(trimmedUserId);
       if (!empInfo) {
         rejectedCount++;
-        logger.warn('DEVICE ERROR', `Log rejected: Employee ZK-PIN "${trimmedUserId}" not found or inactive for tenant ${dispositivo.cliente_id}`);
+        logger.warn('DEVICE ERROR',`Log rejected: Employee ZK-PIN "${trimmedUserId}" not found or inactive for tenant ${clienteId}`);
         continue;
       }
 
