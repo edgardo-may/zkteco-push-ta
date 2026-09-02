@@ -66,17 +66,27 @@ app.get('/health/supabase', async (req, res) => {
 });
 
 // ── DEVICE AUTHORIZATION MIDDLEWARE ──────────────────────────────────────────
-
-const authorizeDevice = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  // ADMS protocol passes SN in query parameter (case insensitive check)
-  const rawSn = String((req.query.SN || req.query.sn) ?? '').trim().toUpperCase();
+const authorizeDevice = async (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) => {
+  // ADMS protocol passes SN in query parameter
+  const rawSn = String((req.query.SN || req.query.sn) ?? '')
+    .trim()
+    .toUpperCase();
 
   if (!rawSn || rawSn.length > 50) {
-    // Health checks or endpoints without SN are allowed to pass through if they don't require auth
     if (req.path === '/health' || req.path === '/health/supabase') {
       return next();
     }
-    logger.warn('DEVICE ERROR', 'Request missing or invalid device Serial Number (SN)', { path: req.path, rawSn });
+
+    logger.warn(
+      'DEVICE ERROR',
+      'Request missing or invalid device Serial Number (SN)',
+      { path: req.path, rawSn }
+    );
+
     return res.status(400).send('INVALID SERIAL');
   }
 
@@ -86,79 +96,149 @@ const authorizeDevice = async (req: express.Request, res: express.Response, next
   logger.info('DIAGNOSTICS', `ADMS SN normalized: "${sn}"`);
 
   try {
-    // 1. Fetch physical device registry in devices table
+    // ─────────────────────────────────────────────────────────────────────
+    // 1. Buscar el dispositivo ZKTeco exclusivamente en devices
+    // ─────────────────────────────────────────────────────────────────────
     const { data: device, error: devErr } = await supabase
       .from('devices')
       .select('*')
       .eq('serial_number', sn)
       .maybeSingle();
 
-    logger.info('DIAGNOSTICS', `Device lookup: ${device ? 'FOUND' : 'NOT_FOUND'}`);
+    logger.info(
+      'DIAGNOSTICS',
+      `Device lookup: ${device ? 'FOUND' : 'NOT_FOUND'}`
+    );
 
-    if (devErr || !device) {
-      logger.warn('DEVICE UNKNOWN', `Unauthorized or unregistered ZKTeco device SN: ${sn}`);
-      return res.status(401).send('UNAUTHORIZED: Device not registered');
+    if (devErr) {
+      logger.error(
+        'DEVICE ERROR',
+        `Error looking up ZKTeco device SN: ${sn}`,
+        devErr
+      );
+
+      return res.status(500).send('INTERNAL SERVER ERROR');
     }
 
-    logger.info('DIAGNOSTICS', `Device active: ${device.is_active ? 'TRUE' : 'FALSE'}`);
+    if (!device) {
+      logger.warn(
+        'DEVICE UNKNOWN',
+        `Unauthorized or unregistered ZKTeco device SN: ${sn}`
+      );
 
-    // 2. Fetch tenant registration to find which client/tenant the device belongs to
-    // and check if the tenant registration is active.
-    const { data: dispositivo, error: dispErr } = await supabase
-      .from('dispositivos')
-      .select('*')
-      .eq('device_id_hikvision', sn)
-      .maybeSingle();
-
-    logger.info('DIAGNOSTICS', `Tenant binding: ${dispositivo ? 'FOUND' : 'NOT_FOUND'}`);
-
-    if (dispErr || !dispositivo) {
-      logger.warn('DEVICE UNKNOWN', `Device SN: ${sn} has no tenant mapping in 'dispositivos'`);
-      return res.status(401).send('UNAUTHORIZED: No tenant mapping found');
+      return res.status(401).send(
+        'UNAUTHORIZED: Device not registered'
+      );
     }
 
-    // 3. Validate statuses
+    logger.info(
+      'DIAGNOSTICS',
+      `Device active: ${device.is_active ? 'TRUE' : 'FALSE'}`
+    );
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 2. Validar que el dispositivo esté activo
+    // ─────────────────────────────────────────────────────────────────────
     if (!device.is_active) {
-      logger.warn('DEVICE ERROR', `Device SN: ${sn} is disabled in 'devices'`, { deviceId: device.id });
-      return res.status(403).send('FORBIDDEN: Device is inactive');
+      logger.warn(
+        'DEVICE ERROR',
+        `Device SN: ${sn} is disabled in 'devices'`,
+        { deviceId: device.id }
+      );
+
+      return res.status(403).send(
+        'FORBIDDEN: Device is inactive'
+      );
     }
 
-    if (dispositivo.estatus !== 'activo') {
-      logger.warn('DEVICE ERROR', `Device SN: ${sn} tenant mapping status is: ${dispositivo.estatus}`, { tenantId: dispositivo.cliente_id });
-      return res.status(403).send(`FORBIDDEN: Tenant device status is ${dispositivo.estatus}`);
+    // ─────────────────────────────────────────────────────────────────────
+    // 3. El tenant de ZKTeco sale directamente de devices.cliente_id
+    //    NO consultar dispositivos (Hikvision)
+    // ─────────────────────────────────────────────────────────────────────
+    const clienteId = device.cliente_id;
+
+    logger.info(
+      'DIAGNOSTICS',
+      `Tenant binding: ${clienteId ? 'FOUND' : 'NOT_FOUND'}`
+    );
+
+    if (!clienteId) {
+      logger.warn(
+        'DEVICE UNKNOWN',
+        `Device SN: ${sn} has no cliente_id in 'devices'`,
+        { deviceId: device.id }
+      );
+
+      return res.status(401).send(
+        'UNAUTHORIZED: No tenant mapping found'
+      );
     }
 
-    // 4. Update last activity & remote IP address in the background
-    const rawIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
-    const ip = typeof rawIp === 'string' ? rawIp.split(',')[0].trim() : rawIp[0];
-    
-    // Perform update asynchronously to avoid blocking device response
+    // ─────────────────────────────────────────────────────────────────────
+    // 4. Actualizar actividad e IP en segundo plano
+    // ─────────────────────────────────────────────────────────────────────
+    const rawIp =
+      req.headers['x-forwarded-for'] ||
+      req.socket.remoteAddress ||
+      '';
+
+    const ip =
+      typeof rawIp === 'string'
+        ? rawIp.split(',')[0].trim()
+        : rawIp[0];
+
     const lastActivity = new Date().toISOString();
-    const updatePayload: Partial<Device> = { last_activity: lastActivity };
+
+    const updatePayload: Partial<Device> = {
+      last_activity: lastActivity
+    };
+
     if (ip && ip !== device.ip_address) {
       updatePayload.ip_address = ip;
     }
 
-    supabase.from('devices')
+    supabase
+      .from('devices')
       .update(updatePayload)
       .eq('id', device.id)
       .then(({ error }) => {
         if (error) {
-          logger.error('DEVICE ERROR', `Failed to update activity status for device SN: ${sn}`, error);
+          logger.error(
+            'DEVICE ERROR',
+            `Failed to update activity status for device SN: ${sn}`,
+            error
+          );
         }
       });
 
-    // Store in res.locals for handlers
+    // ─────────────────────────────────────────────────────────────────────
+    // 5. Guardar información para los handlers
+    // ─────────────────────────────────────────────────────────────────────
     res.locals.device = device as Device;
-    res.locals.dispositivo = dispositivo as Dispositivo;
+
+    // IMPORTANTE:
+    // Ya no usamos Dispositivo de Hikvision para ZKTeco.
+    res.locals.clienteId = clienteId;
+
     res.locals.clientIp = ip;
 
-    logger.info('DEVICE IDENTIFIED', `Device SN: ${device.serial_number} authorized and identified for tenant: ${dispositivo.cliente_id} from IP: ${ip}`);
+    logger.info(
+      'DEVICE IDENTIFIED',
+      `Device SN: ${device.serial_number} authorized and identified for tenant: ${clienteId} from IP: ${ip}`
+    );
 
     next();
+
   } catch (err: any) {
-    logger.error('SERVER ERROR', `Device authorization exception for SN: ${sn}`, err);
-    res.status(500).send('INTERNAL SERVER ERROR');
+    logger.error(
+      'SERVER ERROR',
+      `Device authorization exception for SN: ${sn}`,
+      err
+    );
+
+    return res.status(500).send(
+      'INTERNAL SERVER ERROR'
+    );
   }
 };
 
