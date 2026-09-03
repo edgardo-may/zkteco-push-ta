@@ -721,6 +721,11 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
     const wireCommandId = commandWireId(nextCommand.id);
     const responseText = `C:${wireCommandId}:${wireCommandString}\n`;
 
+    if (/^ENROLL_FP\b/i.test(wireCommandString)) {
+      const debugCommand = wireCommandString.replace(/\t/g, '<TAB>');
+      logger.info('DIAGNOSTICS', `ADMS enrollment command dispatched: SN=${device.serial_number} wireCommandId=${wireCommandId} commandUuid=${nextCommand.id} command=${debugCommand}`);
+    }
+
     logger.info('COMMAND SENT', `ADMS command dispatched: SN=${device.serial_number} wireCommandId=${wireCommandId} commandUuid=${nextCommand.id}`);
 
     res.setHeader('Content-Type', 'text/plain');
