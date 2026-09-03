@@ -15,10 +15,9 @@ const ZK_PUSH_SECRET = process.env.ZK_PUSH_SECRET || '';
 app.use(express.text({ type: '*/*', limit: '10mb' }));
 
 // ── RATE LIMITING ────────────────────────────────────────────────────────────
-// Flexible limits for ADMS devices to prevent abuse without breaking polling
 const admsRateLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 120, // 120 requests per minute per device
+  windowMs: 1 * 60 * 1000,
+  max: 120,
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req, res) => {
@@ -71,7 +70,6 @@ const authorizeDevice = async (
   res: express.Response,
   next: express.NextFunction
 ) => {
-  // ADMS protocol passes SN in query parameter
   const rawSn = String((req.query.SN || req.query.sn) ?? '')
     .trim()
     .toUpperCase();
@@ -92,107 +90,40 @@ const authorizeDevice = async (
 
   const sn = rawSn;
 
-  logger.info('DIAGNOSTICS', `ADMS SN raw: "${rawSn}"`);
-  logger.info('DIAGNOSTICS', `ADMS SN normalized: "${sn}"`);
-
   try {
-    // ─────────────────────────────────────────────────────────────────────
-    // 1. Buscar el dispositivo ZKTeco exclusivamente en devices
-    // ─────────────────────────────────────────────────────────────────────
     const { data: device, error: devErr } = await supabase
       .from('devices')
       .select('*')
       .eq('serial_number', sn)
       .maybeSingle();
 
-    logger.info(
-      'DIAGNOSTICS',
-      `Device lookup: ${device ? 'FOUND' : 'NOT_FOUND'}`
-    );
-
     if (devErr) {
-      logger.error(
-        'DEVICE ERROR',
-        `Error looking up ZKTeco device SN: ${sn}`,
-        devErr
-      );
-
+      logger.error('DEVICE ERROR', `Error looking up ZKTeco device SN: ${sn}`, devErr);
       return res.status(500).send('INTERNAL SERVER ERROR');
     }
 
     if (!device) {
-      logger.warn(
-        'DEVICE UNKNOWN',
-        `Unauthorized or unregistered ZKTeco device SN: ${sn}`
-      );
-
-      return res.status(401).send(
-        'UNAUTHORIZED: Device not registered'
-      );
+      logger.warn('DEVICE UNKNOWN', `Unauthorized or unregistered ZKTeco device SN: ${sn}`);
+      return res.status(401).send('UNAUTHORIZED: Device not registered');
     }
 
-    logger.info(
-      'DIAGNOSTICS',
-      `Device active: ${device.is_active ? 'TRUE' : 'FALSE'}`
-    );
-
-    // ─────────────────────────────────────────────────────────────────────
-    // 2. Validar que el dispositivo esté activo
-    // ─────────────────────────────────────────────────────────────────────
     if (!device.is_active) {
-      logger.warn(
-        'DEVICE ERROR',
-        `Device SN: ${sn} is disabled in 'devices'`,
-        { deviceId: device.id }
-      );
-
-      return res.status(403).send(
-        'FORBIDDEN: Device is inactive'
-      );
+      logger.warn('DEVICE ERROR', `Device SN: ${sn} is disabled in 'devices'`, { deviceId: device.id });
+      return res.status(403).send('FORBIDDEN: Device is inactive');
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // 3. El tenant de ZKTeco sale directamente de devices.cliente_id
-    //    NO consultar dispositivos (Hikvision)
-    // ─────────────────────────────────────────────────────────────────────
     const clienteId = device.cliente_id;
 
-    logger.info(
-      'DIAGNOSTICS',
-      `Tenant binding: ${clienteId ? 'FOUND' : 'NOT_FOUND'}`
-    );
-
     if (!clienteId) {
-      logger.warn(
-        'DEVICE UNKNOWN',
-        `Device SN: ${sn} has no cliente_id in 'devices'`,
-        { deviceId: device.id }
-      );
-
-      return res.status(401).send(
-        'UNAUTHORIZED: No tenant mapping found'
-      );
+      logger.warn('DEVICE UNKNOWN', `Device SN: ${sn} has no cliente_id in 'devices'`, { deviceId: device.id });
+      return res.status(401).send('UNAUTHORIZED: No tenant mapping found');
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // 4. Actualizar actividad e IP en segundo plano
-    // ─────────────────────────────────────────────────────────────────────
-    const rawIp =
-      req.headers['x-forwarded-for'] ||
-      req.socket.remoteAddress ||
-      '';
-
-    const ip =
-      typeof rawIp === 'string'
-        ? rawIp.split(',')[0].trim()
-        : rawIp[0];
-
+    const rawIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+    const ip = typeof rawIp === 'string' ? rawIp.split(',')[0].trim() : rawIp[0];
     const lastActivity = new Date().toISOString();
 
-    const updatePayload: Partial<Device> = {
-      last_activity: lastActivity
-    };
-
+    const updatePayload: Partial<Device> = { last_activity: lastActivity };
     if (ip && ip !== device.ip_address) {
       updatePayload.ip_address = ip;
     }
@@ -203,46 +134,21 @@ const authorizeDevice = async (
       .eq('id', device.id)
       .then(({ error }) => {
         if (error) {
-          logger.error(
-            'DEVICE ERROR',
-            `Failed to update activity status for device SN: ${sn}`,
-            error
-          );
+          logger.error('DEVICE ERROR', `Failed to update activity status for device SN: ${sn}`, error);
         }
       });
 
-    // ─────────────────────────────────────────────────────────────────────
-    // 5. Guardar información para los handlers
-    // ─────────────────────────────────────────────────────────────────────
     res.locals.device = device as Device;
-
-    // IMPORTANTE:
-    // Ya no usamos Dispositivo de Hikvision para ZKTeco.
     res.locals.clienteId = clienteId;
-
     res.locals.clientIp = ip;
 
-    logger.info(
-      'DEVICE IDENTIFIED',
-      `Device SN: ${device.serial_number} authorized and identified for tenant: ${clienteId} from IP: ${ip}`
-    );
-
     next();
-
   } catch (err: any) {
-    logger.error(
-      'SERVER ERROR',
-      `Device authorization exception for SN: ${sn}`,
-      err
-    );
-
-    return res.status(500).send(
-      'INTERNAL SERVER ERROR'
-    );
+    logger.error('SERVER ERROR', `Device authorization exception for SN: ${sn}`, err);
+    return res.status(500).send('INTERNAL SERVER ERROR');
   }
 };
 
-// Apply auth middleware to all /iclock or base endpoints
 app.use(['/iclock*', '/cdata*', '/getrequest*', '/devicecmd*'], admsRateLimiter, authorizeDevice);
 
 // ── ZK ADMS PROTOCOL ENDPOINTS ───────────────────────────────────────────────
@@ -262,7 +168,7 @@ function getTimezoneOffsetHours(tz?: string | null): number {
   return -5;
 }
 
-// 1. Handshake & Registry Query (GET /iclock/cdata or GET /cdata)
+// 1. Handshake & Registry Query
 app.get(['/iclock/cdata', '/cdata'], (req, res) => {
   const device = res.locals.device as Device;
   const ip = res.locals.clientIp;
@@ -275,7 +181,6 @@ app.get(['/iclock/cdata', '/cdata'], (req, res) => {
     tzOffset
   });
 
-  // ZKTeco expects registry config options
   const responseText = [
     `GET OPTION FROM: ${device.serial_number}`,
     'RegistryCode=',
@@ -284,7 +189,7 @@ app.get(['/iclock/cdata', '/cdata'], (req, res) => {
     'PushVersion=3.2.0',
     'MaxCommSize=102400',
     'Realtime=1',
-    'Encrypt=0', // plain text logs
+    'Encrypt=0',
     `Delay=${process.env.HEARTBEAT_INTERVAL || '30'}`,
     `ErrorDelay=${process.env.HEARTBEAT_INTERVAL || '30'}`,
     `TimeZone=${tzOffset}`
@@ -294,7 +199,6 @@ app.get(['/iclock/cdata', '/cdata'], (req, res) => {
   res.status(200).send(responseText);
 });
 
-// ── HELPER: DEBUG DE CDATA DESCONOCIDA (FASE 2.1) ───────────────────────
 // ── HELPER: PROCESAMIENTO Y RECEPCIÓN DE TEMPLATES BIOMÉTRICOS ────────
 async function handleBiometricTemplateUpload(
   device: any,
@@ -318,7 +222,6 @@ async function handleBiometricTemplateUpload(
       return;
     }
 
-    // 1. Buscar assignment activo
     const { data: ass, error: assignmentError } = await supabase
       .from('device_employee_assignments')
       .select('employee_id')
@@ -331,11 +234,6 @@ async function handleBiometricTemplateUpload(
     if (assignmentError) {
       logger.error('SERVER ERROR', `Failed to resolve biometric assignment for SN: ${device?.serial_number}, PIN: ${pinStr}`, assignmentError);
       return;
-    }
-
-    if (table === 'ATTLOG') {
-    logger.info('RAW ATTLOG BODY', `Raw payload: ${JSON.stringify(rawBody)}`);
-    return;
     }
 
     if (!ass?.employee_id) {
@@ -377,7 +275,6 @@ async function handleBiometricTemplateUpload(
 
     const fingerKey = FINGER_MAP[fidNum] || `finger_${fidNum}`;
 
-    // 3. Upsert en biometric_templates
     const { error: upsertErr } = await supabase
       .from('biometric_templates')
       .upsert({
@@ -437,24 +334,10 @@ async function handleUnknownCdataDebug(req: any, res: any) {
       }
     }
 
-    if (process.env.BIOMETRIC_DEBUG === 'true') {
-      const method = req.method;
-      const pathname = req.path;
-      const queryKeys = Object.keys(req.query).join(',');
-      const contentType = req.headers['content-type'] || 'none';
-      const contentLength = req.headers['content-length'] || rawBody.length;
-      logger.info('DEVICE CONNECT', `SN=${device?.serial_number} method=${method} path=${pathname} queryKeys=[${queryKeys}] table=${table} contentType=${contentType} bodyLength=${contentLength} fields=[${keys.join(',')}] PIN=${pinStr} FID=${fidStr} Size=${sizeStr} templateLength=${templateVal.length}`);
-    }
-
-    // Si detectamos template de huella, guardarlo de forma persistente
     if (pinStr !== 'none' && fidStr !== 'none' && templateVal.length > 0) {
       logger.info('DIAGNOSTICS', `BIOMETRIC UPLOAD SN=${device?.serial_number} table=${table} PIN=${pinStr} FID=${fidStr} Size=${sizeStr} templateLength=${templateVal.length}`);
       await handleBiometricTemplateUpload(device, dispositivo, table, pinStr, fidStr, sizeStr, templateVal);
     }
-  }
-
-  if (process.env.BIOMETRIC_DEBUG !== 'true' && lines.length === 0) {
-    logger.info('DEVICE CONNECT', `Device SN: ${device?.serial_number} uploaded table: ${table} (ignoring contents)`);
   }
 
   return res.status(200).send('OK');
@@ -471,6 +354,8 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
     return await handleUnknownCdataDebug(req, res);
   }
 
+  // Debug payload crudo de asistencia
+  logger.info('RAW ATTLOG BODY', `Device SN: ${device.serial_number} sent: ${JSON.stringify(rawBody)}`);
   logger.info('ATTENDANCE RECEIVED', `Device SN: ${device.serial_number} sent raw attendance logs`, { bytes: rawBody.length });
 
   try {
@@ -481,8 +366,6 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
 
     const clienteId = res.locals.clienteId as string;
 
-    // ── EMPLOYEE IDENTIFICATION ──────────────────────────────────────────────
-    // Query active assignments for this device, linking only active employees
     const { data: assignments, error: assignErr } = await supabase
       .from('device_employee_assignments')
       .select(`
@@ -501,7 +384,6 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
       throw assignErr;
     }
 
-    // Build a lookup map of active assignments: mapping biometric_user_id -> id & clave_empleado
     const validEmployeeMap = new Map<string, { id: string; clave: string }>();
     if (assignments) {
       for (const ass of assignments) {
@@ -515,13 +397,10 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
       }
     }
 
-    // ── OPTIMIZED IDEMPOTENCY / DUPLICATE PREVENTION ──────────────────────────
-    // Find min and max timestamps in the batch
     const timestamps = parsedRecords.map(r => r.timestamp);
     const minTimestamp = timestamps.reduce((min, t) => t < min ? t : min, timestamps[0]);
     const maxTimestamp = timestamps.reduce((max, t) => t > max ? t : max, timestamps[0]);
 
-    // Query database for existing logs for this device in the batch timestamp range
     const { data: existingLogs, error: queryErr } = await supabase
       .from('attendance_logs')
       .select('user_id, timestamp')
@@ -533,7 +412,6 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
       throw queryErr;
     }
 
-    // Build a lookup set of existing records: "user_id_timestamp"
     const existingSet = new Set<string>();
     if (existingLogs) {
       for (const log of existingLogs) {
@@ -541,7 +419,6 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
       }
     }
 
-    // Filter out invalid employees & duplicates, and format new logs
     const logsToInsert = [];
     let duplicateCount = 0;
     let rejectedCount = 0;
@@ -549,18 +426,16 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
     for (const record of parsedRecords) {
       const trimmedUserId = record.userId.trim();
 
-      // 1. Verify if employee is registered and active in the database
       const empInfo = validEmployeeMap.get(trimmedUserId);
       if (!empInfo) {
         rejectedCount++;
-        logger.warn('DEVICE ERROR',`Log rejected: Employee ZK-PIN "${trimmedUserId}" not found or inactive for tenant ${clienteId}`);
+        logger.warn('DEVICE ERROR', `Log rejected: Employee ZK-PIN "${trimmedUserId}" not found or inactive for tenant ${clienteId}`);
         continue;
       }
 
       const resolvedClave = empInfo.clave;
-
-      // 2. Verify duplicates (idempotency)
       const compositeKey = `${resolvedClave}_${record.timestamp}`;
+
       if (existingSet.has(compositeKey)) {
         duplicateCount++;
       } else {
@@ -568,9 +443,10 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
           device_serial: device.serial_number,
           user_id: resolvedClave,
           timestamp: record.timestamp,
-          status: record.status
+          status: record.status,
+          verify_type: record.verifyType ?? 1,
+          metodo: record.metodo ?? 'huella'
         });
-        // Add to set to prevent duplicates *within* the same uploaded batch
         existingSet.add(compositeKey);
       }
     }
@@ -583,7 +459,6 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
       logger.info('ATTENDANCE DUPLICATE', `Skipped ${duplicateCount} duplicate logs for device SN: ${device.serial_number}`);
     }
 
-    // Batch insert new attendance logs
     if (logsToInsert.length > 0) {
       const { error: insertErr } = await supabase
         .from('attendance_logs')
@@ -597,7 +472,7 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
       }
 
       for (const log of logsToInsert) {
-        logger.info('ATTENDANCE SAVED', `Saved log: user ${log.user_id} at ${log.timestamp} status: ${log.status} for device: ${device.serial_number}`);
+        logger.info('ATTENDANCE SAVED', `Saved log: user ${log.user_id} at ${log.timestamp} status: ${log.status} [method: ${log.metodo}] for device: ${device.serial_number}`);
       }
     }
 
@@ -631,19 +506,15 @@ function canonicalUserInfoWireCommand(commandString: string): string | null {
     return null;
   }
 
-  // Confirmed by terminal SYZ8243400788: use only the accepted USERINFO fields.
   return `DATA UPDATE USERINFO PIN=${pin}\tName=${name}\tPrivilege=0`;
 }
 
 function commandWireId(commandId: string): string {
   const compactUuid = commandId.replace(/-/g, '');
   if (!/^[0-9a-f]{32}$/i.test(compactUuid)) {
-    // Test and legacy non-UUID IDs retain their historical wire representation.
     return compactUuid.substring(0, 8);
   }
 
-  // SYZ8243400788 confirmed a positive decimal command ID on the wire.
-  // Keep the deterministic eight-digit representation for UUID-backed commands.
   const firstUuidWord = Number.parseInt(compactUuid.substring(0, 8), 16);
   return String((firstUuidWord % 90000000) + 10000000);
 }
@@ -657,8 +528,6 @@ function commandMatchesAckId(command: { id: string }, receivedId: string): boole
     return true;
   }
 
-  // Some devices truncate the UUID/legacy ID. A later uniqueness check prevents a
-  // prefix collision from being resolved to an arbitrary pending command.
   return received.length >= 4 && compactUuid.startsWith(received);
 }
 
@@ -670,15 +539,11 @@ function parseReturnCode(returnValue: string | null): number | null {
   return Number.parseInt(returnValue, 10);
 }
 
-// 3. Command Queue Polling (GET /iclock/getrequest or GET /getrequest)
+// 3. Command Queue Polling
 app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
   const device = res.locals.device as Device;
 
-  // Log heartbeat request
-  logger.info('HEARTBEAT', `Heartbeat received from device SN: ${device.serial_number}`);
-
   try {
-    // Query the oldest pending command for this device.
     const { data: commands, error } = await supabase
       .from('device_commands')
       .select('*')
@@ -690,7 +555,6 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
     if (error) throw error;
 
     if (!commands || commands.length === 0) {
-      // No commands in queue, respond with OK/empty to signal no instructions
       res.setHeader('Content-Type', 'text/plain');
       return res.status(200).send('OK');
     }
@@ -707,7 +571,6 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    // Update assignment status to SYNCING if it is a user update/delete command
     const biometricUserId = commandUserId(nextCommand.command_string);
     if (biometricUserId && isUserCommand(nextCommand.command_string)) {
       const { error: syncErr } = await supabase
@@ -724,14 +587,8 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
       }
     }
 
-    // Format the command string in ZKTeco ADMS syntax: C:<command_id>:<command_string>
     const wireCommandId = commandWireId(nextCommand.id);
     const responseText = `C:${wireCommandId}:${wireCommandString}\n`;
-
-    if (/^ENROLL_FP\b/i.test(wireCommandString)) {
-      const debugCommand = wireCommandString.replace(/\t/g, '<TAB>');
-      logger.info('DIAGNOSTICS', `ADMS enrollment command dispatched: SN=${device.serial_number} wireCommandId=${wireCommandId} commandUuid=${nextCommand.id} command=${debugCommand}`);
-    }
 
     logger.info('COMMAND SENT', `ADMS command dispatched: SN=${device.serial_number} wireCommandId=${wireCommandId} commandUuid=${nextCommand.id}`);
 
@@ -743,7 +600,7 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
   }
 });
 
-// 4. Command Execution Feedback ACK (POST /iclock/devicecmd or POST /devicecmd)
+// 4. Command Execution Feedback ACK
 app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
   const device = res.locals.device as Device;
   const rawBody = (req.body || '').trim();
@@ -763,8 +620,6 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    // Resolve only against this device's unacknowledged commands. An ACK is never
-    // assigned to the first pending row merely because no exact ID match was found.
     let command = null;
 
     if (commandId.length === 36) {
@@ -817,11 +672,9 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
     const resolvedId = command.id;
     const biometricUserId = commandUserId(command.command_string);
 
-    logger.info('DIAGNOSTICS', `ADMS ACK resolved: SN=${device.serial_number} wireCommandId=${commandId} commandUuid=${resolvedId} Return=${returnCode ?? 'invalid'}`);
-
     if (biometricUserId && isUserCommand(command.command_string)) {
       if (returnCode === 0) {
-        const { error: assignmentUpdateErr } = await supabase
+        await supabase
           .from('device_employee_assignments')
           .update({
             sync_status: 'SYNCED',
@@ -831,44 +684,28 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
           })
           .eq('device_id', device.id)
           .eq('biometric_user_id', biometricUserId);
-
-        if (assignmentUpdateErr) {
-          throw assignmentUpdateErr;
-        }
       } else {
-        const { data: currentAssignment, error: assignmentReadErr } = await supabase
+        const { data: currentAssignment } = await supabase
           .from('device_employee_assignments')
           .select('retry_count')
           .eq('device_id', device.id)
           .eq('biometric_user_id', biometricUserId)
           .maybeSingle();
 
-        if (assignmentReadErr) {
-          throw assignmentReadErr;
-        }
-
         const newRetryCount = (currentAssignment?.retry_count || 0) + 1;
-        const { error: assignmentUpdateErr } = await supabase
+        await supabase
           .from('device_employee_assignments')
           .update({
             sync_status: 'ERROR',
-            last_error: returnCode === null
-              ? 'Terminal ACK missing or invalid Return value'
-              : `Terminal Return=${returnCode}`,
+            last_error: returnCode === null ? 'Terminal ACK missing Return value' : `Terminal Return=${returnCode}`,
             retry_count: newRetryCount
           })
           .eq('device_id', device.id)
           .eq('biometric_user_id', biometricUserId);
-
-        if (assignmentUpdateErr) {
-          throw assignmentUpdateErr;
-        }
       }
     }
 
-    // With the current schema, is_executed means the terminal returned an ACK.
-    // Assignment state preserves whether that ACK represents success or failure.
-    const { error: cmdUpdateErr } = await supabase
+    await supabase
       .from('device_commands')
       .update({
         is_executed: true,
@@ -877,16 +714,6 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
       .eq('id', resolvedId)
       .eq('device_serial', device.serial_number);
 
-    if (cmdUpdateErr) {
-      throw cmdUpdateErr;
-    }
-
-    if (returnCode === 0) {
-      logger.info('COMMAND SUCCESS', `ADMS sync succeeded: SN=${device.serial_number} wireCommandId=${commandId} commandUuid=${resolvedId} Return=0.`);
-    } else {
-      logger.warn('COMMAND ERROR', `ADMS sync failed: SN=${device.serial_number} wireCommandId=${commandId} commandUuid=${resolvedId} Return=${returnCode ?? 'invalid'}; command ACK consumed.`);
-    }
-
     res.status(200).send('OK');
   } catch (err: any) {
     logger.error('SERVER ERROR', `Failed to process command ACK for device SN: ${device.serial_number}`, err);
@@ -894,7 +721,6 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
   }
 });
 
-// Start the HTTP listener if not in test environment
 if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, () => {
     logger.info('SERVER INIT', `ZKTeco TA Push Connector running on port ${PORT}`);
