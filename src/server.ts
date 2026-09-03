@@ -601,6 +601,68 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
   }
 });
 
+function commandUserId(commandString: string): string | null {
+  return commandString.match(/\bPin=([^\t\r\n ]+)/i)?.[1].trim() || null;
+}
+
+function isUserCommand(commandString: string): boolean {
+  return /^DATA (?:UPDATE |DELETE )?USER/i.test(commandString);
+}
+
+function commandUserName(commandString: string): string | null {
+  return commandString.match(/(?:^|[\t\r\n])Name=([^\t\r\n]*)/i)?.[1].trim() || null;
+}
+
+function canonicalUserInfoWireCommand(commandString: string): string | null {
+  if (!/^DATA UPDATE USERINFO\b/i.test(commandString)) {
+    return commandString;
+  }
+
+  const pin = commandUserId(commandString);
+  const name = commandUserName(commandString);
+  if (!pin || !name) {
+    return null;
+  }
+
+  // Confirmed by terminal SYZ8243400788: use only the accepted USERINFO fields.
+  return `DATA UPDATE USERINFO PIN=${pin}\nName=${name}\nPrivilege=0`;
+}
+
+function commandWireId(commandId: string): string {
+  const compactUuid = commandId.replace(/-/g, '');
+  if (!/^[0-9a-f]{32}$/i.test(compactUuid)) {
+    // Test and legacy non-UUID IDs retain their historical wire representation.
+    return compactUuid.substring(0, 8);
+  }
+
+  // SYZ8243400788 confirmed a positive decimal command ID on the wire.
+  // Keep the deterministic eight-digit representation for UUID-backed commands.
+  const firstUuidWord = Number.parseInt(compactUuid.substring(0, 8), 16);
+  return String((firstUuidWord % 90000000) + 10000000);
+}
+
+function commandMatchesAckId(command: { id: string }, receivedId: string): boolean {
+  const received = receivedId.trim().toLowerCase();
+  const commandUuid = command.id.toLowerCase();
+  const compactUuid = commandUuid.replace(/-/g, '');
+
+  if (received === commandUuid || received === compactUuid || received === commandWireId(command.id).toLowerCase()) {
+    return true;
+  }
+
+  // Some devices truncate the UUID/legacy ID. A later uniqueness check prevents a
+  // prefix collision from being resolved to an arbitrary pending command.
+  return received.length >= 4 && compactUuid.startsWith(received);
+}
+
+function parseReturnCode(returnValue: string | null): number | null {
+  if (returnValue === null || !/^-?\d+$/.test(returnValue.trim())) {
+    return null;
+  }
+
+  return Number.parseInt(returnValue, 10);
+}
+
 // 3. Command Queue Polling (GET /iclock/getrequest or GET /getrequest)
 app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
   const device = res.locals.device as Device;
@@ -609,7 +671,7 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
   logger.info('HEARTBEAT', `Heartbeat received from device SN: ${device.serial_number}`);
 
   try {
-    // Query the oldest pending command for this device
+    // Query the oldest pending command for this device.
     const { data: commands, error } = await supabase
       .from('device_commands')
       .select('*')
@@ -627,30 +689,39 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
     }
 
     const nextCommand = commands[0];
+    const wireCommandString = canonicalUserInfoWireCommand(nextCommand.command_string);
+
+    if (!wireCommandString) {
+      logger.error('DEVICE ERROR', 'USERINFO command missing required PIN or Name; command was not dispatched', {
+        sn: device.serial_number,
+        commandUuid: nextCommand.id
+      });
+      res.setHeader('Content-Type', 'text/plain');
+      return res.status(200).send('OK');
+    }
 
     // Update assignment status to SYNCING if it is a user update/delete command
-    const userCmdMatch = nextCommand.command_string.match(/Pin=([^\t\n ]+)/i);
-    if (userCmdMatch && /^DATA (?:UPDATE |DELETE )?USER/i.test(nextCommand.command_string)) {
-      const biometricUserId = userCmdMatch[1].trim();
-      supabase.from('device_employee_assignments')
+    const biometricUserId = commandUserId(nextCommand.command_string);
+    if (biometricUserId && isUserCommand(nextCommand.command_string)) {
+      const { error: syncErr } = await supabase
+        .from('device_employee_assignments')
         .update({
           sync_status: 'SYNCING',
           last_attempt_at: new Date().toISOString()
         })
         .eq('device_id', device.id)
-        .eq('biometric_user_id', biometricUserId)
-        .then(({ error: syncErr }) => {
-          if (syncErr) {
-            logger.error('DEVICE ERROR', `Failed to update status to SYNCING for device ID: ${device.id}, user: ${biometricUserId}`, syncErr);
-          }
-        });
+        .eq('biometric_user_id', biometricUserId);
+
+      if (syncErr) {
+        logger.error('DEVICE ERROR', `Failed to update status to SYNCING for device ID: ${device.id}, user: ${biometricUserId}`, syncErr);
+      }
     }
 
     // Format the command string in ZKTeco ADMS syntax: C:<command_id>:<command_string>
-    const shortCmdId = nextCommand.id.replace(/-/g, '').substring(0, 8);
-    const responseText = `C:${shortCmdId}:${nextCommand.command_string}\n`;
+    const wireCommandId = commandWireId(nextCommand.id);
+    const responseText = `C:${wireCommandId}:${wireCommandString}\n`;
 
-    logger.info('COMMAND SENT', `Sent command ${nextCommand.id} to device SN: ${device.serial_number}: ${nextCommand.command_string}`);
+    logger.info('COMMAND SENT', `ADMS command dispatched: SN=${device.serial_number} wireCommandId=${wireCommandId} commandUuid=${nextCommand.id}`);
 
     res.setHeader('Content-Type', 'text/plain');
     res.status(200).send(responseText);
@@ -670,48 +741,59 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
   }
 
   try {
-    // Parse url-encoded structure: e.g. "ID=123e4567-e89b-12d3-a456-426614174000&Return=0"
     const params = new URLSearchParams(rawBody);
     const commandId = params.get('ID') || params.get('id');
     const returnVal = params.get('Return') || params.get('return');
+    const returnCode = parseReturnCode(returnVal);
 
     if (!commandId) {
-      logger.warn('DEVICE ERROR', `Command response missing 'ID' field from device SN: ${device.serial_number}`, { body: rawBody });
+      logger.warn('DEVICE ERROR', `Command response missing ID: SN=${device.serial_number} Return=${returnVal ?? 'missing'}`);
       return res.status(200).send('OK');
     }
 
-    const returnCode = returnVal ? parseInt(returnVal, 10) : -1;
-
-// 1. Resolver el comando (compatible con ID corto o ID truncado)
+    // Resolve only against this device's unacknowledged commands. An ACK is never
+    // assigned to the first pending row merely because no exact ID match was found.
     let command = null;
 
-    // A. Intento de coincidencia exacta si es un UUID válido
     if (commandId.length === 36) {
-      const { data } = await supabase
+      const { data, error: exactCommandErr } = await supabase
         .from('device_commands')
         .select('*')
         .eq('id', commandId)
         .eq('device_serial', device.serial_number)
+        .eq('is_executed', false)
         .maybeSingle();
+      if (exactCommandErr) {
+        throw exactCommandErr;
+      }
       command = data;
     }
 
-    // B. Si es corto o truncado, buscar el comando pendiente más reciente de este equipo
     if (!command) {
-      const { data: pendingCommands } = await supabase
+      const { data: pendingCommands, error: pendingCommandsErr } = await supabase
         .from('device_commands')
         .select('*')
         .eq('device_serial', device.serial_number)
         .eq('is_executed', false)
         .order('created_at', { ascending: false })
-        .limit(10);
+        .limit(50);
+
+      if (pendingCommandsErr) {
+        throw pendingCommandsErr;
+      }
 
       if (pendingCommands && pendingCommands.length > 0) {
-        // Encontrar el comando cuyo ID empiece con el ID recibido o que coincida con el shortId
-        command = pendingCommands.find(c => {
-          const cleanId = c.id.replace(/-/g, '');
-          return c.id.startsWith(commandId) || cleanId.startsWith(commandId);
-        });
+        const matches = pendingCommands.filter(candidate => commandMatchesAckId(candidate, commandId));
+        if (matches.length === 1) {
+          command = matches[0];
+        } else if (matches.length > 1) {
+          logger.error('DEVICE ERROR', 'Ambiguous ADMS ACK command ID; no command was updated', {
+            sn: device.serial_number,
+            receivedId: commandId,
+            candidateUuids: matches.map(candidate => candidate.id)
+          });
+          return res.status(200).send('OK');
+        }
       }
     }
 
@@ -721,66 +803,76 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
     }
 
     const resolvedId = command.id;
+    const biometricUserId = commandUserId(command.command_string);
 
-    // 2. Marcar como ejecutado usando el UUID original resuelto
+    logger.info('DIAGNOSTICS', `ADMS ACK resolved: SN=${device.serial_number} wireCommandId=${commandId} commandUuid=${resolvedId} Return=${returnCode ?? 'invalid'}`);
+
+    if (biometricUserId && isUserCommand(command.command_string)) {
+      if (returnCode === 0) {
+        const { error: assignmentUpdateErr } = await supabase
+          .from('device_employee_assignments')
+          .update({
+            sync_status: 'SYNCED',
+            last_synced_at: new Date().toISOString(),
+            last_error: null,
+            retry_count: 0
+          })
+          .eq('device_id', device.id)
+          .eq('biometric_user_id', biometricUserId);
+
+        if (assignmentUpdateErr) {
+          throw assignmentUpdateErr;
+        }
+      } else {
+        const { data: currentAssignment, error: assignmentReadErr } = await supabase
+          .from('device_employee_assignments')
+          .select('retry_count')
+          .eq('device_id', device.id)
+          .eq('biometric_user_id', biometricUserId)
+          .maybeSingle();
+
+        if (assignmentReadErr) {
+          throw assignmentReadErr;
+        }
+
+        const newRetryCount = (currentAssignment?.retry_count || 0) + 1;
+        const { error: assignmentUpdateErr } = await supabase
+          .from('device_employee_assignments')
+          .update({
+            sync_status: 'ERROR',
+            last_error: returnCode === null
+              ? 'Terminal ACK missing or invalid Return value'
+              : `Terminal Return=${returnCode}`,
+            retry_count: newRetryCount
+          })
+          .eq('device_id', device.id)
+          .eq('biometric_user_id', biometricUserId);
+
+        if (assignmentUpdateErr) {
+          throw assignmentUpdateErr;
+        }
+      }
+    }
+
+    // With the current schema, is_executed means the terminal returned an ACK.
+    // Assignment state preserves whether that ACK represents success or failure.
     const { error: cmdUpdateErr } = await supabase
       .from('device_commands')
       .update({
         is_executed: true,
         updated_at: new Date().toISOString()
       })
-      .eq('id', resolvedId);
+      .eq('id', resolvedId)
+      .eq('device_serial', device.serial_number);
 
-    if (cmdUpdateErr) throw cmdUpdateErr;
+    if (cmdUpdateErr) {
+      throw cmdUpdateErr;
+    }
 
-    // 3. If command matches user sync format, update sync status in assignments
-    const userAckMatch = command?.command_string ? command.command_string.match(/Pin=([^\t\n ]+)/i) : null;
-    if (userAckMatch && /^DATA (?:UPDATE |DELETE )?USER/i.test(command.command_string)) {
-      const biometricUserId = userAckMatch[1].trim();
-        
-        if (returnCode === 0) {
-          // Success
-          await supabase
-            .from('device_employee_assignments')
-            .update({
-              sync_status: 'SYNCED',
-              last_synced_at: new Date().toISOString(),
-              last_error: null,
-              retry_count: 0
-            })
-            .eq('device_id', device.id)
-            .eq('biometric_user_id', biometricUserId);
-
-          logger.info('COMMAND SUCCESS', `Command ${resolvedId} successfully executed by device SN: ${device.serial_number} (Return: ${returnCode}). Assignment for user ${biometricUserId} marked as SYNCED.`);
-        } else {
-          // Failure
-          const { data: currentAssignment } = await supabase
-            .from('device_employee_assignments')
-            .select('retry_count')
-            .eq('device_id', device.id)
-            .eq('biometric_user_id', biometricUserId)
-            .maybeSingle();
-
-          const newRetryCount = (currentAssignment?.retry_count || 0) + 1;
-
-          await supabase
-            .from('device_employee_assignments')
-            .update({
-              sync_status: 'ERROR',
-              last_error: `Error de terminal (Código: ${returnCode})`,
-              retry_count: newRetryCount
-            })
-            .eq('device_id', device.id)
-            .eq('biometric_user_id', biometricUserId);
-
-          logger.warn('COMMAND ERROR', `Command ${resolvedId} failed execution on device SN: ${device.serial_number} (Return: ${returnCode}). Assignment for user ${biometricUserId} marked as ERROR.`);
-        }
+    if (returnCode === 0) {
+      logger.info('COMMAND SUCCESS', `ADMS sync succeeded: SN=${device.serial_number} wireCommandId=${commandId} commandUuid=${resolvedId} Return=0.`);
     } else {
-      if (returnCode === 0) {
-        logger.info('COMMAND SUCCESS', `Command ${resolvedId} successfully executed by device SN: ${device.serial_number} (Return: ${returnCode})`);
-      } else {
-        logger.warn('COMMAND ERROR', `Command ${resolvedId} failed execution on device SN: ${device.serial_number} (Return: ${returnCode})`);
-      }
+      logger.warn('COMMAND ERROR', `ADMS sync failed: SN=${device.serial_number} wireCommandId=${commandId} commandUuid=${resolvedId} Return=${returnCode ?? 'invalid'}; command ACK consumed.`);
     }
 
     res.status(200).send('OK');
