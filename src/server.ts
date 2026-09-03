@@ -277,57 +277,159 @@ app.get(['/iclock/cdata', '/cdata'], (req, res) => {
 });
 
 // ── HELPER: DEBUG DE CDATA DESCONOCIDA (FASE 2.1) ───────────────────────
-function handleUnknownCdataDebug(req: any, res: any) {
+// ── HELPER: PROCESAMIENTO Y RECEPCIÓN DE TEMPLATES BIOMÉTRICOS ────────
+async function handleBiometricTemplateUpload(
+  device: any,
+  dispositivo: any,
+  table: string,
+  pinStr: string,
+  fidStr: string,
+  sizeStr: string,
+  templateVal: string
+) {
+  try {
+    const fidNum = parseInt(fidStr, 10);
+    if (isNaN(fidNum) || fidNum < 0 || fidNum > 9) {
+      logger.warn('DEVICE WARNING', `Invalid FID received for SN: ${device?.serial_number}, PIN: ${pinStr}, FID: ${fidStr}`);
+      return;
+    }
+
+    const clienteId = dispositivo?.cliente_id || device?.cliente_id;
+    if (!clienteId) {
+      logger.warn('DEVICE WARNING', `No cliente_id found for device SN: ${device?.serial_number}`);
+      return;
+    }
+
+    // 1. Buscar assignment activo
+    const { data: ass } = await supabase
+      .from('device_employee_assignments')
+      .select('employee_id, cliente_id, biometric_user_id')
+      .eq('device_id', device.id)
+      .eq('biometric_user_id', pinStr)
+      .maybeSingle();
+
+    let employeeId = ass?.employee_id;
+
+    // 2. Si no hay assignment previo (ej. enrolado directo en checador), buscar por device_userid
+    if (!employeeId) {
+      const { data: emp } = await supabase
+        .from('empleados')
+        .select('id, cliente_id')
+        .eq('cliente_id', clienteId)
+        .eq('device_userid', pinStr)
+        .maybeSingle();
+
+      if (emp) {
+        employeeId = emp.id;
+        // Crear assignment automático para consolidar la relación
+        await supabase.from('device_employee_assignments').upsert({
+          cliente_id: clienteId,
+          device_id: device.id,
+          employee_id: emp.id,
+          biometric_user_id: pinStr,
+          activo: true,
+          sync_status: 'SYNCED'
+        }, { onConflict: 'device_id,biometric_user_id' });
+      }
+    }
+
+    if (!employeeId) {
+      logger.warn('DEVICE WARNING', `No employee found for device SN: ${device?.serial_number}, PIN: ${pinStr}`);
+      return;
+    }
+
+    const FINGER_MAP: Record<number, string> = {
+      0: 'left_thumb',
+      1: 'left_index',
+      2: 'left_middle',
+      3: 'left_ring',
+      4: 'left_pinky',
+      5: 'right_thumb',
+      6: 'right_index',
+      7: 'right_middle',
+      8: 'right_ring',
+      9: 'right_pinky',
+    };
+
+    const fingerKey = FINGER_MAP[fidNum] || `finger_${fidNum}`;
+
+    // 3. Upsert en biometric_templates
+    const { error: upsertErr } = await supabase
+      .from('biometric_templates')
+      .upsert({
+        cliente_id: clienteId,
+        empleado_id: employeeId,
+        device_id: device.id,
+        tipo: 'huella',
+        indice: fidNum,
+        finger_key: fingerKey,
+        template_data: templateVal,
+        actualizado_at: new Date().toISOString()
+      }, {
+        onConflict: 'empleado_id,tipo,indice'
+      });
+
+    if (upsertErr) {
+      logger.error('SERVER ERROR', `Failed to upsert biometric template for employee ${employeeId}, FID: ${fidNum}`, upsertErr);
+    } else {
+      logger.info('DEVICE IDENTIFIED', `Biometric template saved: SN=${device?.serial_number} table=${table} PIN=${pinStr} FID=${fidNum} fingerKey=${fingerKey} size=${sizeStr} templateLength=${templateVal.length}`);
+    }
+  } catch (err: any) {
+    logger.error('SERVER ERROR', `Exception in handleBiometricTemplateUpload for SN: ${device?.serial_number}`, err);
+  }
+}
+
+// ── HELPER: DEBUG Y RECEPCIÓN DE CDATA (FINGERTMP / BIODATA) ───────────
+async function handleUnknownCdataDebug(req: any, res: any) {
   const device = res.locals.device;
+  const dispositivo = res.locals.dispositivo;
   const table = req.query.table as string;
   const rawBody = req.body || '';
 
-  if (process.env.BIOMETRIC_DEBUG === 'true') {
-    // Extraer metadata del request
-    const method = req.method;
-    const pathname = req.path;
-    const queryKeys = Object.keys(req.query).join(',');
-    const contentType = req.headers['content-type'] || 'none';
-    const contentLength = req.headers['content-length'] || rawBody.length;
-    
-    // El payload de ZKTeco suele ser texto plano separado por saltos de línea (\r\n o \n)
-    const lines = rawBody.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
-    
-    // Analizar la primera línea para inferir campos
-    let detectedFields = '';
+  const lines = rawBody.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
+
+  for (const line of lines) {
+    const pairs = line.split('\t');
     let pinStr = 'none';
     let fidStr = 'none';
     let sizeStr = 'none';
-    let templateLength = 0;
+    let templateVal = '';
+    const keys: string[] = [];
 
-    if (lines.length > 0) {
-      const firstLine = lines[0];
-      // Normalmente el ADMS envía pares Key=Value separados por tabuladores
-      const pairs = firstLine.split('\t');
-      const keys = [];
-      for (const pair of pairs) {
-        const eqIdx = pair.indexOf('=');
-        if (eqIdx > 0) {
-          const key = pair.substring(0, eqIdx);
-          const val = pair.substring(eqIdx + 1);
-          keys.push(key);
-          
-          const keyUpper = key.toUpperCase();
-          if (keyUpper === 'PIN' || keyUpper === 'USERID') pinStr = val;
-          if (keyUpper === 'FID') fidStr = val;
-          if (keyUpper === 'SIZE') sizeStr = val;
-          if (keyUpper === 'TMP' || keyUpper === 'TEMPLATE' || keyUpper === 'BIODATA') templateLength = val.length;
-        } else {
-          // Si no tiene '=', registramos que hay un token anónimo
-          keys.push('RAW_TOKEN');
-        }
+    for (const pair of pairs) {
+      const eqIdx = pair.indexOf('=');
+      if (eqIdx > 0) {
+        const key = pair.substring(0, eqIdx);
+        const val = pair.substring(eqIdx + 1);
+        keys.push(key);
+
+        const keyUpper = key.toUpperCase();
+        if (keyUpper === 'PIN' || keyUpper === 'USERID') pinStr = val;
+        if (keyUpper === 'FID') fidStr = val;
+        if (keyUpper === 'SIZE') sizeStr = val;
+        if (keyUpper === 'TMP' || keyUpper === 'TEMPLATE' || keyUpper === 'BIODATA') templateVal = val;
+      } else {
+        keys.push('RAW_TOKEN');
       }
-      detectedFields = keys.join(',');
     }
 
-    logger.info('DEVICE CONNECT', `SN=${device.serial_number} method=${method} path=${pathname} queryKeys=[${queryKeys}] table=${table} contentType=${contentType} bodyLength=${contentLength} lines=${lines.length} fields=[${detectedFields}] PIN=${pinStr} FID=${fidStr} Size=${sizeStr} templateLength=${templateLength}`);
-  } else {
-    logger.info('DEVICE CONNECT', `Device SN: ${device.serial_number} uploaded table: ${table} (ignoring contents)`);
+    if (process.env.BIOMETRIC_DEBUG === 'true') {
+      const method = req.method;
+      const pathname = req.path;
+      const queryKeys = Object.keys(req.query).join(',');
+      const contentType = req.headers['content-type'] || 'none';
+      const contentLength = req.headers['content-length'] || rawBody.length;
+      logger.info('DEVICE CONNECT', `SN=${device?.serial_number} method=${method} path=${pathname} queryKeys=[${queryKeys}] table=${table} contentType=${contentType} bodyLength=${contentLength} fields=[${keys.join(',')}] PIN=${pinStr} FID=${fidStr} Size=${sizeStr} templateLength=${templateVal.length}`);
+    }
+
+    // Si detectamos template de huella, guardarlo de forma persistente
+    if (pinStr !== 'none' && fidStr !== 'none' && templateVal.length > 0) {
+      await handleBiometricTemplateUpload(device, dispositivo, table, pinStr, fidStr, sizeStr, templateVal);
+    }
+  }
+
+  if (process.env.BIOMETRIC_DEBUG !== 'true' && lines.length === 0) {
+    logger.info('DEVICE CONNECT', `Device SN: ${device?.serial_number} uploaded table: ${table} (ignoring contents)`);
   }
 
   return res.status(200).send('OK');
@@ -341,7 +443,7 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
 
   // ── DISPATCHER DE TABLAS ADMS ──
   if (table !== 'ATTLOG') {
-    return handleUnknownCdataDebug(req, res);
+    return await handleUnknownCdataDebug(req, res);
   }
 
   logger.info('ATTENDANCE RECEIVED', `Device SN: ${device.serial_number} sent raw attendance logs`, { bytes: rawBody.length });

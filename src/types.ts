@@ -46,3 +46,12 @@ export interface ParsedAttendanceRecord {
   timestamp: string; // ISO String in device local time or UTC
   status: string; // check_in, check_out, etc.
 }
+
+export interface ParsedFingerprintTemplate {
+  pin: string;
+  fid: number;
+  size: number;
+  template: string;
+  valid: boolean;
+}
+
