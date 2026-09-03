@@ -247,15 +247,32 @@ app.use(['/iclock*', '/cdata*', '/getrequest*', '/devicecmd*'], admsRateLimiter,
 
 // ── ZK ADMS PROTOCOL ENDPOINTS ───────────────────────────────────────────────
 
+function getTimezoneOffsetHours(tz?: string | null): number {
+  if (!tz) return -5;
+  try {
+    const d = new Date();
+    const str = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'shortOffset' }).format(d);
+    const match = str.match(/GMT([+-]?\d+)/);
+    if (match) {
+      return parseInt(match[1], 10);
+    }
+  } catch {
+    // fallback
+  }
+  return -5;
+}
+
 // 1. Handshake & Registry Query (GET /iclock/cdata or GET /cdata)
 app.get(['/iclock/cdata', '/cdata'], (req, res) => {
   const device = res.locals.device as Device;
   const ip = res.locals.clientIp;
+  const tzOffset = getTimezoneOffsetHours(device.timezone);
 
   logger.info('DEVICE CONNECT', `Device SN: ${device.serial_number} initialized connection`, {
     ip,
     name: device.name,
-    timezone: device.timezone
+    timezone: device.timezone,
+    tzOffset
   });
 
   // ZKTeco expects registry config options
@@ -269,7 +286,8 @@ app.get(['/iclock/cdata', '/cdata'], (req, res) => {
     'Realtime=1',
     'Encrypt=0', // plain text logs
     `Delay=${process.env.HEARTBEAT_INTERVAL || '30'}`,
-    `ErrorDelay=${process.env.HEARTBEAT_INTERVAL || '30'}`
+    `ErrorDelay=${process.env.HEARTBEAT_INTERVAL || '30'}`,
+    `TimeZone=${tzOffset}`
   ].join('\n') + '\n';
 
   res.setHeader('Content-Type', 'text/plain');
@@ -611,23 +629,21 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
     const nextCommand = commands[0];
 
     // Update assignment status to SYNCING if it is a user update/delete command
-    if (nextCommand.command_string.startsWith('DATA UPDATE USERINFO Pin=') || nextCommand.command_string.startsWith('DATA DELETE USERINFO Pin=')) {
-      const match = nextCommand.command_string.match(/Pin=([^\t\n ]+)/);
-      if (match) {
-        const biometricUserId = match[1].trim();
-        supabase.from('device_employee_assignments')
-          .update({
-            sync_status: 'SYNCING',
-            last_attempt_at: new Date().toISOString()
-          })
-          .eq('device_id', device.id)
-          .eq('biometric_user_id', biometricUserId)
-          .then(({ error: syncErr }) => {
-            if (syncErr) {
-              logger.error('DEVICE ERROR', `Failed to update status to SYNCING for device ID: ${device.id}, user: ${biometricUserId}`, syncErr);
-            }
-          });
-      }
+    const userCmdMatch = nextCommand.command_string.match(/Pin=([^\t\n ]+)/i);
+    if (userCmdMatch && /^DATA (?:UPDATE |DELETE )?USER/i.test(nextCommand.command_string)) {
+      const biometricUserId = userCmdMatch[1].trim();
+      supabase.from('device_employee_assignments')
+        .update({
+          sync_status: 'SYNCING',
+          last_attempt_at: new Date().toISOString()
+        })
+        .eq('device_id', device.id)
+        .eq('biometric_user_id', biometricUserId)
+        .then(({ error: syncErr }) => {
+          if (syncErr) {
+            logger.error('DEVICE ERROR', `Failed to update status to SYNCING for device ID: ${device.id}, user: ${biometricUserId}`, syncErr);
+          }
+        });
     }
 
     // Format the command string in ZKTeco ADMS syntax: C:<command_id>:<command_string>
@@ -718,10 +734,9 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
     if (cmdUpdateErr) throw cmdUpdateErr;
 
     // 3. If command matches user sync format, update sync status in assignments
-    if (command && (command.command_string.startsWith('DATA UPDATE USERINFO Pin=') || command.command_string.startsWith('DATA DELETE USERINFO Pin='))) {
-      const match = command.command_string.match(/Pin=([^\t\n ]+)/);
-      if (match) {
-        const biometricUserId = match[1].trim();
+    const userAckMatch = command?.command_string ? command.command_string.match(/Pin=([^\t\n ]+)/i) : null;
+    if (userAckMatch && /^DATA (?:UPDATE |DELETE )?USER/i.test(command.command_string)) {
+      const biometricUserId = userAckMatch[1].trim();
         
         if (returnCode === 0) {
           // Success
@@ -760,7 +775,6 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
 
           logger.warn('COMMAND ERROR', `Command ${resolvedId} failed execution on device SN: ${device.serial_number} (Return: ${returnCode}). Assignment for user ${biometricUserId} marked as ERROR.`);
         }
-      }
     } else {
       if (returnCode === 0) {
         logger.info('COMMAND SUCCESS', `Command ${resolvedId} successfully executed by device SN: ${device.serial_number} (Return: ${returnCode})`);
