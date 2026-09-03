@@ -319,42 +319,43 @@ async function handleBiometricTemplateUpload(
     }
 
     // 1. Buscar assignment activo
-    const { data: ass } = await supabase
+    const { data: ass, error: assignmentError } = await supabase
       .from('device_employee_assignments')
-      .select('employee_id, cliente_id, biometric_user_id')
+      .select('employee_id')
       .eq('device_id', device.id)
+      .eq('cliente_id', clienteId)
       .eq('biometric_user_id', pinStr)
+      .eq('activo', true)
       .maybeSingle();
 
-    let employeeId = ass?.employee_id;
-
-    // 2. Si no hay assignment previo (ej. enrolado directo en checador), buscar por device_userid
-    if (!employeeId) {
-      const { data: emp } = await supabase
-        .from('empleados')
-        .select('id, cliente_id')
-        .eq('cliente_id', clienteId)
-        .eq('device_userid', pinStr)
-        .maybeSingle();
-
-      if (emp) {
-        employeeId = emp.id;
-        // Crear assignment automático para consolidar la relación
-        await supabase.from('device_employee_assignments').upsert({
-          cliente_id: clienteId,
-          device_id: device.id,
-          employee_id: emp.id,
-          biometric_user_id: pinStr,
-          activo: true,
-          sync_status: 'SYNCED'
-        }, { onConflict: 'device_id,biometric_user_id' });
-      }
-    }
-
-    if (!employeeId) {
-      logger.warn('DEVICE WARNING', `No employee found for device SN: ${device?.serial_number}, PIN: ${pinStr}`);
+    if (assignmentError) {
+      logger.error('SERVER ERROR', `Failed to resolve biometric assignment for SN: ${device?.serial_number}, PIN: ${pinStr}`, assignmentError);
       return;
     }
+
+    if (!ass?.employee_id) {
+      logger.warn('DEVICE WARNING', `No active assignment found for biometric upload: SN=${device?.serial_number} PIN=${pinStr}`);
+      return;
+    }
+
+    const { data: employee, error: employeeError } = await supabase
+      .from('empleados')
+      .select('id')
+      .eq('id', ass.employee_id)
+      .eq('cliente_id', clienteId)
+      .maybeSingle();
+
+    if (employeeError) {
+      logger.error('SERVER ERROR', `Failed to validate assigned employee for SN: ${device?.serial_number}, PIN: ${pinStr}`, employeeError);
+      return;
+    }
+
+    if (!employee) {
+      logger.warn('DEVICE WARNING', `Assigned employee is not valid for tenant biometric upload: SN=${device?.serial_number} PIN=${pinStr}`);
+      return;
+    }
+
+    const employeeId = employee.id;
 
     const FINGER_MAP: Record<number, string> = {
       0: 'left_thumb',
@@ -384,13 +385,13 @@ async function handleBiometricTemplateUpload(
         template_data: templateVal,
         actualizado_at: new Date().toISOString()
       }, {
-        onConflict: 'empleado_id,tipo,indice'
+        onConflict: 'empleado_id,device_id,tipo,indice'
       });
 
     if (upsertErr) {
       logger.error('SERVER ERROR', `Failed to upsert biometric template for employee ${employeeId}, FID: ${fidNum}`, upsertErr);
     } else {
-      logger.info('DEVICE IDENTIFIED', `Biometric template saved: SN=${device?.serial_number} table=${table} PIN=${pinStr} FID=${fidNum} fingerKey=${fingerKey} size=${sizeStr} templateLength=${templateVal.length}`);
+      logger.info('DEVICE IDENTIFIED', `Biometric template saved: SN=${device?.serial_number} PIN=${pinStr} FID=${fidNum} fingerKey=${fingerKey}`);
     }
   } catch (err: any) {
     logger.error('SERVER ERROR', `Exception in handleBiometricTemplateUpload for SN: ${device?.serial_number}`, err);
@@ -421,8 +422,8 @@ async function handleUnknownCdataDebug(req: any, res: any) {
         const val = pair.substring(eqIdx + 1);
         keys.push(key);
 
-        const keyUpper = key.toUpperCase();
-        if (keyUpper === 'PIN' || keyUpper === 'USERID') pinStr = val;
+        const keyUpper = key.trim().toUpperCase();
+        if (keyUpper === 'PIN' || keyUpper === 'USERID' || keyUpper === 'FP PIN' || keyUpper === 'USER PIN') pinStr = val.trim();
         if (keyUpper === 'FID') fidStr = val;
         if (keyUpper === 'SIZE') sizeStr = val;
         if (keyUpper === 'TMP' || keyUpper === 'TEMPLATE' || keyUpper === 'BIODATA') templateVal = val;
@@ -442,6 +443,7 @@ async function handleUnknownCdataDebug(req: any, res: any) {
 
     // Si detectamos template de huella, guardarlo de forma persistente
     if (pinStr !== 'none' && fidStr !== 'none' && templateVal.length > 0) {
+      logger.info('DIAGNOSTICS', `BIOMETRIC UPLOAD SN=${device?.serial_number} table=${table} PIN=${pinStr} FID=${fidStr} Size=${sizeStr} templateLength=${templateVal.length}`);
       await handleBiometricTemplateUpload(device, dispositivo, table, pinStr, fidStr, sizeStr, templateVal);
     }
   }
