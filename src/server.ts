@@ -610,7 +610,7 @@ function isUserCommand(commandString: string): boolean {
 }
 
 function commandUserName(commandString: string): string | null {
-  return commandString.match(/(?:^|[\t\r\n])Name=([^\t\r\n]*)/i)?.[1].trim() || null;
+  return commandString.match(/\bName=([^\t\r\n]+)/i)?.[1].trim() || null;
 }
 
 function canonicalUserInfoWireCommand(commandString: string): string | null {
@@ -625,7 +625,7 @@ function canonicalUserInfoWireCommand(commandString: string): string | null {
   }
 
   // Confirmed by terminal SYZ8243400788: use only the accepted USERINFO fields.
-  return `DATA UPDATE USERINFO PIN=${pin}\nName=${name}\nPrivilege=0`;
+  return `DATA UPDATE USERINFO PIN=${pin}\tName=${name}\tPrivilege=0`;
 }
 
 function commandWireId(commandId: string): string {
@@ -890,4 +890,4 @@ if (process.env.NODE_ENV !== 'test') {
   });
 }
 
-export { app };
+export { app, canonicalUserInfoWireCommand };
