@@ -333,6 +333,11 @@ async function handleBiometricTemplateUpload(
       return;
     }
 
+    if (table === 'ATTLOG') {
+    logger.info('RAW ATTLOG BODY', `Raw payload: ${JSON.stringify(rawBody)}`);
+    return;
+    }
+
     if (!ass?.employee_id) {
       logger.warn('DEVICE WARNING', `No active assignment found for biometric upload: SN=${device?.serial_number} PIN=${pinStr}`);
       return;
