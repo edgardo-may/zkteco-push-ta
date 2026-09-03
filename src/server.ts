@@ -355,7 +355,7 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
   }
 
   // Debug payload crudo de asistencia
-  logger.info('RAW ATTLOG BODY', `Device SN: ${device.serial_number} sent: ${JSON.stringify(rawBody)}`);
+  logger.info('DIAGNOSTICS', `[RAW ATTLOG] Device SN: ${device.serial_number} sent: ${JSON.stringify(rawBody)}`);
   logger.info('ATTENDANCE RECEIVED', `Device SN: ${device.serial_number} sent raw attendance logs`, { bytes: rawBody.length });
 
   try {
