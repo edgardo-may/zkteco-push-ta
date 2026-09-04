@@ -29,6 +29,8 @@ export interface AttendanceLog {
   user_id: string;
   timestamp: string;
   status: string;
+  verify_type?: number;
+  metodo?: string;
   created_at?: string;
 }
 
@@ -43,8 +45,10 @@ export interface DeviceCommand {
 
 export interface ParsedAttendanceRecord {
   userId: string;
-  timestamp: string; // ISO String in device local time or UTC
+  timestamp: string; // ISO String in UTC
   status: string; // check_in, check_out, etc.
+  verifyType?: number;
+  metodo?: string;
 }
 
 export interface ParsedFingerprintTemplate {
@@ -54,4 +58,3 @@ export interface ParsedFingerprintTemplate {
   template: string;
   valid: boolean;
 }
-
