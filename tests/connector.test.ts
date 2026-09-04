@@ -1,6 +1,6 @@
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { app } from '../src/server.js';
+import { app, canonicalUserInfoWireCommand, isSafeDeleteUserInfoCommand } from '../src/server.js';
 import { supabase } from '../src/supabase.js';
 import { parseAttendanceLogs } from '../src/parser.js';
 
@@ -220,6 +220,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     mockDevices = [
       {
         id: 'dev_1',
+        cliente_id: 'tenant_company_a',
         name: 'SpeedFace Main Entrance',
         serial_number: 'ZKTEST123',
         is_active: true,
@@ -230,6 +231,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
       },
       {
         id: 'dev_disabled',
+        cliente_id: 'tenant_company_a',
         name: 'Disabled SpeedFace',
         serial_number: 'ZKTEST_DISABLED',
         is_active: false,
@@ -304,6 +306,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     mockCommands = [
       {
         id: 'cmd_1',
+        cliente_id: 'tenant_company_a',
         device_serial: 'ZKTEST123',
         command_string: 'INFO',
         is_executed: false,
@@ -336,6 +339,25 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     assert.strictEqual(parsed[0].status, 'break_out');
     assert.strictEqual(parsed[1].userId, '104');
     assert.strictEqual(parsed[1].status, 'break_in');
+  });
+
+  test('USERINFO - Should preserve Name while normalizing legacy fields', () => {
+    const normalized = canonicalUserInfoWireCommand(
+      'DATA UPDATE USERINFO Pin=1\nName=Edgardo May Chan\nPri=0'
+    );
+
+    assert.strictEqual(
+      normalized,
+      'DATA UPDATE USERINFO PIN=1\tName=Edgardo May Chan\tPrivilege=0'
+    );
+    assert.ok(normalized?.includes('PIN=1'));
+    assert.ok(normalized?.includes('Name=Edgardo May Chan'));
+    assert.ok(normalized?.includes('Privilege=0'));
+  });
+
+  test('DELETE USERINFO - only uppercase numeric PIN form is safe', () => {
+    assert.strictEqual(isSafeDeleteUserInfoCommand('DATA DELETE USERINFO PIN=201'), true);
+    assert.strictEqual(isSafeDeleteUserInfoCommand('DATA DELETE USERINFO Pin=201'), false);
   });
 
   // ── 2. HANDSHAKE TESTS ─────────────────────────────────────────────────────
@@ -403,6 +425,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     // Add a user update command to the queue
     mockCommands.push({
       id: 'cmd_sync_update',
+      cliente_id: 'tenant_company_a',
       device_serial: 'ZKTEST123',
       command_string: 'DATA UPDATE USERINFO Pin=201\tName=Juan Perez\tPri=0',
       is_executed: false,
@@ -432,6 +455,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     // Setup command and initial syncing state (since database is reset before each test)
     mockCommands.push({
       id: 'cmd_sync_update',
+      cliente_id: 'tenant_company_a',
       device_serial: 'ZKTEST123',
       command_string: 'DATA UPDATE USERINFO Pin=201\tName=Juan Perez\tPri=0',
       is_executed: false,
@@ -459,6 +483,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     // Setup command and initial syncing state (since database is reset before each test)
     mockCommands.push({
       id: 'cmd_sync_error',
+      cliente_id: 'tenant_company_a',
       device_serial: 'ZKTEST123',
       command_string: 'DATA UPDATE USERINFO Pin=201\tName=Juan Perez\tPri=0',
       is_executed: false,
@@ -542,8 +567,9 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     // Queue a DELETE command
     mockCommands.push({
       id: 'cmd_delete_user',
+      cliente_id: 'tenant_company_a',
       device_serial: 'ZKTEST123',
-      command_string: 'DATA DELETE USERINFO Pin=201',
+      command_string: 'DATA DELETE USERINFO PIN=201',
       is_executed: false,
       created_at: new Date().toISOString()
     });
@@ -557,10 +583,143 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     const res = await fetch(`${baseUrl}/iclock/getrequest?SN=ZKTEST123`);
     assert.strictEqual(res.status, 200);
     const body = await res.text();
-    assert.ok(body.includes('DATA DELETE USERINFO Pin=201'));
+    assert.ok(body.includes('DATA DELETE USERINFO PIN=201'));
 
     // Check status is updated to SYNCING
     assert.strictEqual(assign?.sync_status, 'SYNCING');
+  });
+
+  test('Provisioning - unsafe DELETE USERINFO variants are blocked and consumed', async () => {
+    const unsafeCommands = [
+      'DATA DELETE USERINFO Pin=9999',
+      'DATA DELETE USERINFO pin=9999',
+      'DATA DELETE USERINFO',
+      'DATA DELETE USERINFO *',
+      'DATA DELETE USERINFO PIN=*',
+      'DATA DELETE USERINFO PIN=',
+      'DATA DELETE USERINFO PIN=9999\tName=ignored'
+    ];
+
+    for (const [index, command_string] of unsafeCommands.entries()) {
+      mockCommands = [{
+        id: `cmd_unsafe_${index}`,
+        device_serial: 'ZKTEST123',
+        command_string,
+        is_executed: false,
+        created_at: new Date().toISOString()
+      }];
+
+      const res = await fetch(`${baseUrl}/iclock/getrequest?SN=ZKTEST123`);
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(await res.text(), 'OK');
+      assert.strictEqual(mockCommands[0]?.is_executed, true);
+      assert.ok(mockCommands[0]?.updated_at);
+    }
+  });
+
+  test('Provisioning - uppercase numeric DELETE USERINFO remains dispatchable', async () => {
+    mockCommands = [{
+      id: 'cmd_safe_delete',
+      device_serial: 'ZKTEST123',
+      command_string: 'DATA DELETE USERINFO PIN=9999',
+      is_executed: false,
+      created_at: new Date().toISOString()
+    }];
+
+    const res = await fetch(`${baseUrl}/iclock/getrequest?SN=ZKTEST123`);
+    assert.strictEqual(res.status, 200);
+    assert.ok((await res.text()).includes('DATA DELETE USERINFO PIN=9999'));
+    assert.strictEqual(mockCommands[0]?.is_executed, false);
+  });
+
+  test('Provisioning - DELETE Return=0 confirms removal without reactivating assignment', async () => {
+    mockCommands = [{
+      id: 'cmd_delete_success',
+      cliente_id: 'tenant_company_a',
+      device_serial: 'ZKTEST123',
+      command_string: 'DATA DELETE USERINFO PIN=201',
+      is_executed: false,
+      created_at: new Date().toISOString()
+    }];
+    const assign = mockAssignments.find(a => a.biometric_user_id === '201');
+    if (assign) {
+      assign.activo = false;
+      assign.suspension_reason = 'EMPLOYEE_DEACTIVATED';
+      assign.sync_status = 'SYNCING';
+    }
+
+    const res = await fetch(`${baseUrl}/iclock/devicecmd?SN=ZKTEST123`, {
+      method: 'POST',
+      body: 'ID=cmd_delete_success&Return=0'
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(assign?.activo, false);
+    assert.strictEqual(assign?.suspension_reason, 'EMPLOYEE_DEACTIVATED');
+    assert.strictEqual(assign?.sync_status, 'SYNCED');
+    assert.strictEqual(mockCommands[0]?.is_executed, true);
+    assert.ok(mockCommands[0]?.updated_at);
+    assert.strictEqual(mockCommands.length, 1);
+  });
+
+  test('Provisioning - DELETE Return!=0 leaves removal in ERROR and consumes its ACK', async () => {
+    mockCommands = [{
+      id: 'cmd_delete_error',
+      cliente_id: 'tenant_company_a',
+      device_serial: 'ZKTEST123',
+      command_string: 'DATA DELETE USERINFO PIN=201',
+      is_executed: false,
+      created_at: new Date().toISOString()
+    }];
+    const assign = mockAssignments.find(a => a.biometric_user_id === '201');
+    if (assign) {
+      assign.activo = false;
+      assign.suspension_reason = 'EMPLOYEE_DEACTIVATED';
+      assign.sync_status = 'SYNCING';
+    }
+
+    const res = await fetch(`${baseUrl}/iclock/devicecmd?SN=ZKTEST123`, {
+      method: 'POST',
+      body: 'ID=cmd_delete_error&Return=-7'
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(assign?.activo, false);
+    assert.strictEqual(assign?.sync_status, 'ERROR');
+    assert.strictEqual(assign?.last_error, 'Terminal Return=-7');
+    assert.strictEqual(assign?.retry_count, 1);
+    assert.strictEqual(mockCommands[0]?.is_executed, true);
+    assert.ok(mockCommands[0]?.updated_at);
+    assert.strictEqual(mockCommands.length, 1);
+  });
+
+  test('Provisioning - ACK never updates an assignment from another tenant', async () => {
+    mockCommands = [{
+      id: 'cmd_tenant_a',
+      cliente_id: 'tenant_company_a',
+      device_serial: 'ZKTEST123',
+      command_string: 'DATA DELETE USERINFO PIN=201',
+      is_executed: false,
+      created_at: new Date().toISOString()
+    }];
+    mockAssignments.push({
+      id: 'assign_cross_tenant',
+      cliente_id: 'tenant_company_b',
+      device_id: 'dev_1',
+      employee_id: 'emp_other_tenant',
+      biometric_user_id: '201',
+      activo: false,
+      sync_status: 'PENDING'
+    });
+
+    const res = await fetch(`${baseUrl}/iclock/devicecmd?SN=ZKTEST123`, {
+      method: 'POST',
+      body: 'ID=cmd_tenant_a&Return=0'
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(mockAssignments.find(a => a.id === 'assign_1')?.sync_status, 'SYNCED');
+    assert.strictEqual(mockAssignments.find(a => a.id === 'assign_cross_tenant')?.sync_status, 'PENDING');
   });
 
   test('Provisioning - Device Offline should keep command and status pending', async () => {
@@ -570,6 +729,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     // Queue a command but do NOT poll heartbeat
     mockCommands.push({
       id: 'cmd_offline',
+      cliente_id: 'tenant_company_a',
       device_serial: 'ZKTEST123',
       command_string: 'DATA UPDATE USERINFO Pin=201\tName=Juan Perez',
       is_executed: false,
@@ -595,6 +755,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
     mockCommands.push(
       {
         id: 'cmd_dup_old',
+        cliente_id: 'tenant_company_a',
         device_serial: 'ZKTEST123',
         command_string: 'DATA UPDATE USERINFO Pin=201\tName=Old Name',
         is_executed: false,
@@ -602,6 +763,7 @@ describe('ZKTeco TA Push Connector Integration Tests', () => {
       },
       {
         id: 'cmd_dup_new',
+        cliente_id: 'tenant_company_a',
         device_serial: 'ZKTEST123',
         command_string: 'DATA UPDATE USERINFO Pin=201\tName=New Name',
         is_executed: false,

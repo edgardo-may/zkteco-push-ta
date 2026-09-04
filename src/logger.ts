@@ -14,6 +14,7 @@ export type LogCategory =
   | 'BIOMETRIC ERROR'
   | 'COMMAND QUEUED'
   | 'COMMAND SENT'
+  | 'COMMAND BLOCKED'
   | 'COMMAND SUCCESS'
   | 'COMMAND ERROR'
   | 'DEVICE ERROR'

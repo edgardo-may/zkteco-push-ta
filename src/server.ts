@@ -611,6 +611,16 @@ function isUserCommand(commandString: string): boolean {
   return /^DATA (?:UPDATE |DELETE )?USER/i.test(commandString);
 }
 
+function isDeleteUserInfoCommand(commandString: string): boolean {
+  return /^\s*DATA\s+DELETE\s+USERINFO\b/i.test(commandString);
+}
+
+// DELETE USERINFO is hazardous on this firmware. Do not normalize a malformed
+// payload: only this full, uppercase, numeric form may reach the terminal.
+function isSafeDeleteUserInfoCommand(commandString: string): boolean {
+  return /^DATA DELETE USERINFO PIN=[0-9]+$/.test(commandString);
+}
+
 function commandUserName(commandString: string): string | null {
   return commandString.match(/\bName=([^\t\r\n]+)/i)?.[1].trim() || null;
 }
@@ -668,6 +678,7 @@ function parseReturnCode(returnValue: string | null): number | null {
 // 3. Command Queue Polling (GET /iclock/getrequest or GET /getrequest)
 app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
   const device = res.locals.device as Device;
+  const clienteId = res.locals.clienteId as string;
 
   // Log heartbeat request
   logger.info('HEARTBEAT', `Heartbeat received from device SN: ${device.serial_number}`);
@@ -691,6 +702,30 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
     }
 
     const nextCommand = commands[0];
+
+    if (isDeleteUserInfoCommand(nextCommand.command_string) && !isSafeDeleteUserInfoCommand(nextCommand.command_string)) {
+      logger.error('COMMAND BLOCKED', 'Unsafe DELETE USERINFO command', {
+        sn: device.serial_number,
+        commandUuid: nextCommand.id
+      });
+
+      // device_commands has no error column in production. Consume the unsafe
+      // row so polling cannot retry it forever; do not infer a PIN from it.
+      const { error: blockErr } = await supabase
+        .from('device_commands')
+        .update({
+          is_executed: true,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', nextCommand.id)
+        .eq('device_serial', device.serial_number);
+
+      if (blockErr) throw blockErr;
+
+      res.setHeader('Content-Type', 'text/plain');
+      return res.status(200).send('OK');
+    }
+
     const wireCommandString = canonicalUserInfoWireCommand(nextCommand.command_string);
 
     if (!wireCommandString) {
@@ -712,6 +747,7 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
           last_attempt_at: new Date().toISOString()
         })
         .eq('device_id', device.id)
+        .eq('cliente_id', clienteId)
         .eq('biometric_user_id', biometricUserId);
 
       if (syncErr) {
@@ -741,6 +777,7 @@ app.get(['/iclock/getrequest', '/getrequest'], async (req, res) => {
 // 4. Command Execution Feedback ACK (POST /iclock/devicecmd or POST /devicecmd)
 app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
   const device = res.locals.device as Device;
+  const clienteId = res.locals.clienteId as string;
   const rawBody = (req.body || '').trim();
 
   if (!rawBody) {
@@ -825,6 +862,7 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
             retry_count: 0
           })
           .eq('device_id', device.id)
+          .eq('cliente_id', clienteId)
           .eq('biometric_user_id', biometricUserId);
 
         if (assignmentUpdateErr) {
@@ -835,6 +873,7 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
           .from('device_employee_assignments')
           .select('retry_count')
           .eq('device_id', device.id)
+          .eq('cliente_id', clienteId)
           .eq('biometric_user_id', biometricUserId)
           .maybeSingle();
 
@@ -853,6 +892,7 @@ app.post(['/iclock/devicecmd', '/devicecmd'], async (req, res) => {
             retry_count: newRetryCount
           })
           .eq('device_id', device.id)
+          .eq('cliente_id', clienteId)
           .eq('biometric_user_id', biometricUserId);
 
         if (assignmentUpdateErr) {
@@ -897,4 +937,4 @@ if (process.env.NODE_ENV !== 'test') {
   });
 }
 
-export { app, canonicalUserInfoWireCommand };
+export { app, canonicalUserInfoWireCommand, isSafeDeleteUserInfoCommand };
