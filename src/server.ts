@@ -4,12 +4,17 @@ import { supabase } from './supabase.js';
 import { logger } from './logger.js';
 import { parseAttendanceLogs } from './parser.js';
 import { Device } from './types.js';
+import { SupabaseAttendanceSourceEventRepository } from './attendance-sources/supabase-repository.js';
+import { toZktecoAttendanceSourceEvent } from './attendance-sources/adapters.js';
 import 'dotenv/config';
 
 const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const ZK_PUSH_SECRET = process.env.ZK_PUSH_SECRET || '';
+// La tabla universal ya fue aplicada con RLS. Este repositorio solo se invoca
+// después de guardar attendance_logs; no participa en el ACK del dispositivo.
+const attendanceSourceEventRepository = new SupabaseAttendanceSourceEventRepository();
 
 // Middleware to parse raw text bodies (since ZK devices upload plain text payloads)
 app.use(express.text({ type: '*/*', limit: '10mb' }));
@@ -372,11 +377,13 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
         biometric_user_id,
         empleados!inner (
           id,
+          cliente_id,
           clave_empleado,
           activo
         )
       `)
       .eq('device_id', device.id)
+      .eq('cliente_id', clienteId)
       .eq('activo', true)
       .eq('empleados.activo', true);
 
@@ -388,7 +395,7 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
     if (assignments) {
       for (const ass of assignments) {
         const emp = ass.empleados as any;
-        if (ass.biometric_user_id && emp && emp.clave_empleado) {
+        if (ass.biometric_user_id && emp && emp.clave_empleado && emp.cliente_id === clienteId) {
           validEmployeeMap.set(ass.biometric_user_id.trim(), {
             id: emp.id,
             clave: emp.clave_empleado.trim()
@@ -403,7 +410,7 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
 
     const { data: existingLogs, error: queryErr } = await supabase
       .from('attendance_logs')
-      .select('user_id, timestamp')
+      .select('id, user_id, timestamp')
       .eq('device_serial', device.serial_number)
       .gte('timestamp', minTimestamp)
       .lte('timestamp', maxTimestamp);
@@ -473,6 +480,65 @@ app.post(['/iclock/cdata', '/cdata'], async (req, res) => {
 
       for (const log of logsToInsert) {
         logger.info('ATTENDANCE SAVED', `Saved log: user ${log.user_id} at ${log.timestamp} status: ${log.status} [method: ${log.metodo}] for device: ${device.serial_number}`);
+      }
+    }
+
+    // Recuperar los UUID reales después del upsert. Así, un reintento que ya
+    // existía puede crear/recuperar su source event sin insertar otro ATTLOG.
+    const { data: persistedLogs, error: persistedLogsError } = await supabase
+      .from('attendance_logs')
+      .select('id, user_id, timestamp')
+      .eq('device_serial', device.serial_number)
+      .gte('timestamp', minTimestamp)
+      .lte('timestamp', maxTimestamp);
+
+    if (persistedLogsError) {
+      // attendance_logs ya quedó guardado; no convertir este fallo secundario
+      // en un rechazo ADMS. El reintento posterior podrá completar la capa RAW.
+      logger.error('SERVER ERROR', 'Could not resolve persisted ATTLOG ids', persistedLogsError);
+    } else {
+      const receivedAt = new Date().toISOString();
+      for (const record of parsedRecords) {
+        const hardwareUserId = record.userId.trim();
+        const empInfo = validEmployeeMap.get(hardwareUserId);
+        if (!empInfo) continue;
+
+        const persisted = (persistedLogs ?? []).find((log: any) =>
+          log.user_id === empInfo.clave &&
+          new Date(log.timestamp).getTime() === new Date(record.timestamp).getTime()
+        ) as { id: string; user_id: string; timestamp: string } | undefined;
+
+        if (!persisted?.id) {
+          logger.warn('DEVICE WARNING', 'ATTLOG persisted without a resolvable id', {
+            deviceSerial: device.serial_number,
+            employeeId: empInfo.id,
+          });
+          continue;
+        }
+
+        try {
+          const sourceEvent = toZktecoAttendanceSourceEvent({
+            clienteId: clienteId,
+            deviceId: device.id,
+            employeeId: empInfo.id,
+            attendanceLogId: persisted.id,
+            occurredAt: record.timestamp,
+            receivedAt,
+            deviceSerial: device.serial_number,
+            hardwareUserId,
+            rawStatus: record.status,
+            verifyType: record.verifyType,
+          });
+          await attendanceSourceEventRepository.createOrGet(sourceEvent);
+        } catch (sourceEventError) {
+          // El ATTLOG es la fuente RAW operativa y ya fue persistido. No se
+          // elimina ni se devuelve un error que provoque reenvíos del terminal.
+          logger.error('SERVER ERROR', 'Could not persist ZKTeco source event', {
+            deviceSerial: device.serial_number,
+            employeeId: empInfo.id,
+            error: sourceEventError instanceof Error ? sourceEventError.message : String(sourceEventError),
+          });
+        }
       }
     }
 
